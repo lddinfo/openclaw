@@ -7,9 +7,9 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { ReadableStream as NodeReadableStream } from "node:stream/web";
 import { extractArchive } from "../agents/skills-install-extract.js";
-import { fetchWithSsrFGuard } from "../infra/net/fetch-guard.js";
 import { isWithinDir } from "../infra/path-safety.js";
 import { ensureDir } from "../utils.js";
+import { proxyExternalHttpViaRuntimeAgent } from "./runtime-agent-local-proxy.js";
 
 const SAFE_SKILL_KEY = /^[a-z0-9][a-z0-9-_]*$/;
 
@@ -161,27 +161,23 @@ export async function installSkillPackageFromRegistryDownload(params: {
 
   try {
     await ensureDir(skillsRoot);
-    const { response, release } = await fetchWithSsrFGuard({
+    const response = await proxyExternalHttpViaRuntimeAgent({
       url: params.downloadUrl.trim(),
+      method: "GET",
       timeoutMs,
-      auditContext: "control-plane-skill-registry-install",
     });
-    try {
-      if (!response.ok || !response.body) {
-        return {
-          ok: false,
-          message: `download failed (${response.status} ${response.statusText})`,
-        };
-      }
-      const body = response.body as unknown;
-      const readable = isNodeReadableStream(body)
-        ? body
-        : Readable.fromWeb(body as NodeReadableStream);
-      const file = fs.createWriteStream(tempPath);
-      await pipeline(readable, file);
-    } finally {
-      await release();
+    if (!response.ok || !response.body) {
+      return {
+        ok: false,
+        message: `download failed (${response.status} ${response.statusText})`,
+      };
     }
+    const body = response.body as unknown;
+    const readable = isNodeReadableStream(body)
+      ? body
+      : Readable.fromWeb(body as NodeReadableStream);
+    const file = fs.createWriteStream(tempPath);
+    await pipeline(readable, file);
 
     const bytes = (await fs.promises.stat(tempPath)).size;
     const sha256 = await hashFileSha256(tempPath);

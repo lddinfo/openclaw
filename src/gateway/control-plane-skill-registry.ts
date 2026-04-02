@@ -1,5 +1,5 @@
-import { fetchWithSsrFGuard } from "../infra/net/fetch-guard.js";
 import { loadControlPlaneRuntimeState } from "./control-plane-runtime.js";
+import { proxyExternalHttpViaRuntimeAgent } from "./runtime-agent-local-proxy.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -81,36 +81,29 @@ export async function requestControlPlaneJson(
 ): Promise<JsonObject> {
   const baseUrl = readControlPlaneBaseUrl();
   const requestUrl = new URL(pathname, baseUrl).toString();
-  const { response, release } = await fetchWithSsrFGuard({
+  const response = await proxyExternalHttpViaRuntimeAgent({
     url: requestUrl,
+    method: "POST",
+    headers: buildRuntimeHeaders() as Record<string, string>,
+    body: JSON.stringify(body),
     timeoutMs: 45_000,
-    auditContext: "control-plane-skill-registry",
-    init: {
-      method: "POST",
-      headers: buildRuntimeHeaders(),
-      body: JSON.stringify(body),
-    },
   });
 
-  try {
-    const payload = (await response.json().catch(() => ({}))) as unknown;
-    if (!response.ok) {
-      throw new Error(
-        readErrorMessage(payload) ??
-          `control plane request failed (${response.status} ${response.statusText})`,
-      );
-    }
-    if (!isJsonObject(payload)) {
-      throw new Error("control plane returned a non-object payload");
-    }
-    if (payload.success === false) {
-      throw new Error(readErrorMessage(payload) ?? "control plane reported failure");
-    }
-    const data = isJsonObject(payload.data) ? payload.data : undefined;
-    return data ?? payload;
-  } finally {
-    await release();
+  const payload = (await response.json().catch(() => ({}))) as unknown;
+  if (!response.ok) {
+    throw new Error(
+      readErrorMessage(payload) ??
+        `control plane request failed (${response.status} ${response.statusText})`,
+    );
   }
+  if (!isJsonObject(payload)) {
+    throw new Error("control plane returned a non-object payload");
+  }
+  if (payload.success === false) {
+    throw new Error(readErrorMessage(payload) ?? "control plane reported failure");
+  }
+  const data = isJsonObject(payload.data) ? payload.data : undefined;
+  return data ?? payload;
 }
 
 export function buildRuntimeAgentContext(): JsonObject {

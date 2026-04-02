@@ -217,7 +217,6 @@ echo "  [package] ${LOCAL_PACKAGE_PATH}"
 
 copy_if_exists "${OPENCLAW_MAC_PROFILE_SOURCE}/openclaw.json" "${OUT_DIR}/.openclaw/openclaw.json"
 copy_if_exists "${OPENCLAW_MAC_PROFILE_SOURCE}/exec-approvals.json" "${OUT_DIR}/.openclaw/exec-approvals.json"
-copy_if_exists "${OPENCLAW_MAC_PROFILE_SOURCE}/control-plane-state.json" "${OUT_DIR}/.openclaw/control-plane-state.json"
 copy_if_exists "${OPENCLAW_HOME}/workspace/SOUL.md" "${OUT_DIR}/.openclaw/workspace/SOUL.md"
 create_bundle_env "${BUNDLE_ENV_PATH}"
 
@@ -231,7 +230,6 @@ This bundle contains:
 - .openclaw/.env
 - .openclaw/openclaw.json
 - .openclaw/exec-approvals.json
-- .openclaw/control-plane-state.json
 - .openclaw/workspace/SOUL.md
 
 Important:
@@ -240,6 +238,11 @@ Important:
 - Do NOT use \`npm install -g openclaw@latest\` on the target Mac, because the
   upstream package does not include the control-plane compatibility layer used
   by agent-bot-task-a.
+- Preserve the target Mac's existing \`~/.openclaw/control-plane-state.json\`
+  during upgrades. That file stores the remote-agent-to-local-agent sync mapping.
+  If it gets overwritten, portal chat may report
+  \`REMOTE_AGENT_NOT_FOUND: remote agent is not synced to a local OpenClaw agent\`
+  even when the old workspace files still exist.
 
 To import on a target Mac:
 
@@ -260,8 +263,11 @@ To import on a target Mac:
    sed "s#__OPENCLAW_HOME__#\$HOME/.openclaw#g" ~/${OUT_BASENAME}/.openclaw/.env > ~/.openclaw/.env
    cp ~/${OUT_BASENAME}/.openclaw/openclaw.json ~/.openclaw/openclaw.json
    cp ~/${OUT_BASENAME}/.openclaw/exec-approvals.json ~/.openclaw/exec-approvals.json
-   cp ~/${OUT_BASENAME}/.openclaw/control-plane-state.json ~/.openclaw/control-plane-state.json
    cp ~/${OUT_BASENAME}/.openclaw/workspace/SOUL.md ~/.openclaw/workspace/SOUL.md
+
+   # Do NOT overwrite ~/.openclaw/control-plane-state.json during upgrades.
+   # Keep the target machine's existing file so synced remoteAgentId/localAgentKey
+   # mappings survive package updates.
 
 5. Choose how you want to run the Gateway:
 
@@ -317,7 +323,7 @@ if [ -f "\${BUNDLE_DIR}/.openclaw/exec-approvals.json" ]; then
   cp "\${BUNDLE_DIR}/.openclaw/exec-approvals.json" "\$HOME/.openclaw/exec-approvals.json"
 fi
 if [ -f "\${BUNDLE_DIR}/.openclaw/control-plane-state.json" ]; then
-  cp "\${BUNDLE_DIR}/.openclaw/control-plane-state.json" "\$HOME/.openclaw/control-plane-state.json"
+  echo "Preserving existing \$HOME/.openclaw/control-plane-state.json; bundled control-plane-state.json is ignored."
 fi
 if [ -f "\${BUNDLE_DIR}/.openclaw/workspace/SOUL.md" ]; then
   mkdir -p "\$HOME/.openclaw/workspace"

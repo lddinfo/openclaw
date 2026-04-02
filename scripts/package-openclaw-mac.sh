@@ -92,16 +92,51 @@ print(value)
 PY
 }
 
+read_existing_env_value() {
+  local source_env="$1"
+  local key="$2"
+  [ -f "${source_env}" ] || return 1
+
+  python3 - "${source_env}" "${key}" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+key = sys.argv[2]
+text = path.read_text(encoding="utf-8")
+matches = re.findall(rf'^[ \t]*{re.escape(key)}[ \t]*=[ \t]*(.+)[ \t]*$', text, re.MULTILINE)
+if not matches:
+    raise SystemExit(1)
+value = matches[-1].strip()
+if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+    value = value[1:-1]
+print(value)
+PY
+}
+
 create_bundle_env() {
   local dst="$1"
   local source_env="${OPENCLAW_HOME}/.env"
   local generated_bridge_token="${OPENCLAW_BRIDGE_TOKEN:-}"
+  local agent_bot_api_base_url="${AGENT_BOT_API_BASE_URL:-}"
+  local control_plane_base_url="${CONTROL_PLANE_BASE_URL:-}"
+  local agent_bot_base_url="${AGENT_BOT_BASE_URL:-}"
 
   if [ -z "${generated_bridge_token}" ]; then
     generated_bridge_token="$(read_existing_bridge_token "${source_env}" 2>/dev/null || true)"
   fi
   if [ -z "${generated_bridge_token}" ]; then
     generated_bridge_token="change-me"
+  fi
+  if [ -z "${agent_bot_api_base_url}" ]; then
+    agent_bot_api_base_url="$(read_existing_env_value "${source_env}" "AGENT_BOT_API_BASE_URL" 2>/dev/null || true)"
+  fi
+  if [ -z "${control_plane_base_url}" ]; then
+    control_plane_base_url="$(read_existing_env_value "${source_env}" "CONTROL_PLANE_BASE_URL" 2>/dev/null || true)"
+  fi
+  if [ -z "${agent_bot_base_url}" ]; then
+    agent_bot_base_url="$(read_existing_env_value "${source_env}" "AGENT_BOT_BASE_URL" 2>/dev/null || true)"
   fi
 
   cat > "${dst}" <<EOF
@@ -113,6 +148,22 @@ EOF
   cat >> "${dst}" <<'EOF'
 OPENCLAW_CONTROL_PLANE_STATE_FILE="__OPENCLAW_HOME__/control-plane-state.json"
 EOF
+
+  if [ -n "${agent_bot_api_base_url}" ]; then
+    cat >> "${dst}" <<EOF
+AGENT_BOT_API_BASE_URL=$(dotenv_quote "${agent_bot_api_base_url}")
+EOF
+  fi
+  if [ -n "${control_plane_base_url}" ]; then
+    cat >> "${dst}" <<EOF
+CONTROL_PLANE_BASE_URL=$(dotenv_quote "${control_plane_base_url}")
+EOF
+  fi
+  if [ -n "${agent_bot_base_url}" ]; then
+    cat >> "${dst}" <<EOF
+AGENT_BOT_BASE_URL=$(dotenv_quote "${agent_bot_base_url}")
+EOF
+  fi
 }
 
 echo
@@ -275,7 +326,50 @@ fi
 if [ -f "\${BUNDLE_DIR}/.openclaw/.env" ]; then
   BUNDLE_ENV_CONTENT="\$(<"\${BUNDLE_DIR}/.openclaw/.env")"
   BUNDLE_ENV_CONTENT="\${BUNDLE_ENV_CONTENT//__OPENCLAW_HOME__/\$HOME/.openclaw}"
-  printf '%s\n' "\${BUNDLE_ENV_CONTENT}" > "\$HOME/.openclaw/.env"
+  EXISTING_ENV_PATH="\$HOME/.openclaw/.env"
+  TMP_ENV_PATH="\$HOME/.openclaw/.env.tmp.\$\$"
+  printf '%s\n' "\${BUNDLE_ENV_CONTENT}" > "\${TMP_ENV_PATH}"
+  python3 - "\${TMP_ENV_PATH}" "\${EXISTING_ENV_PATH}" <<'PY'
+import pathlib
+import re
+import sys
+
+bundle_path = pathlib.Path(sys.argv[1])
+existing_path = pathlib.Path(sys.argv[2])
+preserve_keys = [
+    "AGENT_BOT_API_BASE_URL",
+    "CONTROL_PLANE_BASE_URL",
+    "AGENT_BOT_BASE_URL",
+]
+
+def parse_env(path: pathlib.Path):
+    result = {}
+    if not path.exists():
+        return result
+    text = path.read_text(encoding="utf-8")
+    for key in preserve_keys:
+        matches = re.findall(rf'^[ \t]*{re.escape(key)}[ \t]*=[ \t]*(.+)[ \t]*$', text, re.MULTILINE)
+        if matches:
+            result[key] = matches[-1].strip()
+    return result
+
+bundle_text = bundle_path.read_text(encoding="utf-8")
+existing = parse_env(existing_path)
+bundle = parse_env(bundle_path)
+
+merged_lines = bundle_text.splitlines()
+for key in preserve_keys:
+    value = bundle.get(key) or existing.get(key)
+    if value:
+        merged_lines = [
+            line for line in merged_lines
+            if not re.match(rf'^[ \t]*{re.escape(key)}[ \t]*=', line)
+        ]
+        merged_lines.append(f"{key}={value}")
+
+bundle_path.write_text("\n".join(merged_lines).rstrip("\n") + "\n", encoding="utf-8")
+PY
+  mv "\${TMP_ENV_PATH}" "\${EXISTING_ENV_PATH}"
 fi
 
 echo "Installed local OpenClaw package: \${PACKAGE_NAME}"

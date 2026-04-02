@@ -56,7 +56,7 @@ export function createSkillRegistryInstallTool(opts?: { workspaceDir?: string })
     label: "Skill Registry Install",
     name: "skill_registry_install",
     description:
-      "Install a published skill version from the control-plane skill registry into the current agent workspace after user confirmation.",
+      "Install a published skill version from the control-plane skill registry into the current agent workspace after user confirmation. Use this instead of shell commands like `openclaw skills install`.",
     parameters: SkillRegistryInstallToolSchema,
     execute: async (toolCallId, args) => {
       const params = args as Record<string, unknown>;

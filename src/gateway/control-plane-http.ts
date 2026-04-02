@@ -509,6 +509,7 @@ description: 优先从当前基座 Skill 仓库中搜索、推荐并安装 Skill
 优先使用 \`skill_registry_search\` 搜索当前基座 Skill 仓库。
 
 - 找到内部 Skill 时：先推荐候选版本与用途，得到确认后再调用 \`skill_registry_install\`
+- 安装内部 Skill 时：不要使用 \`openclaw skills install ...\`、\`npx\`、\`curl\`、\`bash\` 或其他 shell 命令；那样会绕过基座仓库并可能回落到 ClawHub
 - 内部 Skill 无结果时：先询问用户是否允许外部查询
 - 未获得用户授权前：不要建议 ClawHub、skills.sh、GitHub 等外部 Skill 来源
 `,
@@ -815,6 +816,7 @@ function buildPortalExtraSystemPrompt(params: {
       `The workspace already includes the platform skill ${PLATFORM_DEFAULT_FIND_SKILL_NAME}.`,
       "When the user asks for existing capabilities, integrations, or reusable automation, search the skill registry first with skill_registry_search.",
       "Before calling skill_registry_install, summarize the candidate skill and get explicit user confirmation in chat.",
+      "Never install internal skills via exec, shell, or `openclaw skills install`; that path may bypass the control-plane registry and fall back to local/default sources such as ClawHub.",
       params.session.externalSkillLookupAllowed === true
         ? "The user has explicitly allowed external skill lookup if the internal registry has no match."
         : "Do not use ClawHub, skills.sh, GitHub skill lists, or any external skill source unless the user explicitly authorizes external lookup in this session.",

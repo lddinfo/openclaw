@@ -34,7 +34,10 @@ import type {
   ControlPlaneRuntimeAgent,
   ControlPlaneRuntimeRole,
 } from "./control-plane-runtime.js";
-import { installSkillPackageFromRegistryDownload } from "./control-plane-skill-install.js";
+import {
+  installSkillPackageFromInlineArchive,
+  installSkillPackageFromRegistryDownload,
+} from "./control-plane-skill-install.js";
 import {
   recommendSkillsFromControlPlane,
   type ControlPlaneSkillSearchResult,
@@ -1786,11 +1789,14 @@ export async function handleControlPlaneHttpRequest(
       return true;
     }
     const dataObj = readOptionalObject(body, "data");
+    const archiveBase64 =
+      readOptionalString(body, "archiveBase64", "artifactBase64") ??
+      (dataObj ? readOptionalString(dataObj, "archiveBase64", "artifactBase64") : undefined);
     const downloadUrl =
       readOptionalString(body, "downloadUrl") ??
       (dataObj ? readOptionalString(dataObj, "downloadUrl") : undefined);
-    if (!downloadUrl) {
-      sendJson(res, 400, { error: "missing downloadUrl" });
+    if (!archiveBase64 && !downloadUrl) {
+      sendJson(res, 400, { error: "missing archiveBase64 or downloadUrl" });
       return true;
     }
     const skillKey =
@@ -1808,6 +1814,10 @@ export async function handleControlPlaneHttpRequest(
     const artifactFormat =
       readOptionalString(body, "artifactFormat", "format") ??
       (artifactObj ? readOptionalString(artifactObj, "format") : undefined);
+    const archiveFileName =
+      readOptionalString(body, "archiveFileName", "fileName") ??
+      (artifactObj ? readOptionalString(artifactObj, "fileName", "name") : undefined) ??
+      (dataObj ? readOptionalString(dataObj, "archiveFileName", "fileName") : undefined);
     const expectedSha256 =
       readOptionalString(body, "sha256", "expectedSha256", "artifactSha256") ??
       (artifactObj ? readOptionalString(artifactObj, "sha256") : undefined);
@@ -1818,15 +1828,26 @@ export async function handleControlPlaneHttpRequest(
     const timeoutMs =
       typeof timeoutRaw === "number" && Number.isFinite(timeoutRaw) ? timeoutRaw : undefined;
 
-    const result = await installSkillPackageFromRegistryDownload({
-      workspaceDir,
-      downloadUrl,
-      skillKey,
-      artifactFormat,
-      expectedSha256,
-      stripComponents,
-      timeoutMs,
-    });
+    const result = archiveBase64
+      ? await installSkillPackageFromInlineArchive({
+          workspaceDir,
+          archiveBase64,
+          archiveFileName,
+          skillKey,
+          artifactFormat,
+          expectedSha256,
+          stripComponents,
+          timeoutMs,
+        })
+      : await installSkillPackageFromRegistryDownload({
+          workspaceDir,
+          downloadUrl: downloadUrl!,
+          skillKey,
+          artifactFormat,
+          expectedSha256,
+          stripComponents,
+          timeoutMs,
+        });
     if (!result.ok) {
       sendJson(res, 400, { error: result.message });
       return true;

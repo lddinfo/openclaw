@@ -69,30 +69,91 @@ function resolveArchiveTypeAndSuffix(params: {
  * When the registry archive uses `single-folder` layout (`my-skill/SKILL.md`), extraction leaves
  * `skills/<skillKey>/my-skill/SKILL.md`. Promote inner files to `skills/<skillKey>/` when safe.
  */
-async function promoteSingleFolderSkillLayout(skillRoot: string): Promise<void> {
-  const rootSkillMd = path.join(skillRoot, "SKILL.md");
-  if (await fileExists(rootSkillMd)) {
-    return;
-  }
+function isMacOsMetadataEntry(name: string): boolean {
+  return name === "__MACOSX" || name === ".DS_Store" || name.startsWith("._");
+}
+
+async function removeMacOsMetadataEntries(rootDir: string): Promise<void> {
   let entries: fs.Dirent[];
   try {
-    entries = await fs.promises.readdir(skillRoot, { withFileTypes: true });
+    entries = await fs.promises.readdir(rootDir, { withFileTypes: true });
   } catch {
     return;
   }
-  const dirs = entries.filter((e) => e.isDirectory() && !e.name.startsWith("."));
-  const files = entries.filter((e) => e.isFile());
-  if (dirs.length !== 1 || files.length > 0) {
-    return;
+
+  for (const entry of entries) {
+    const entryPath = path.join(rootDir, entry.name);
+    if (isMacOsMetadataEntry(entry.name)) {
+      await fs.promises.rm(entryPath, { recursive: true, force: true }).catch(() => undefined);
+      continue;
+    }
+    if (entry.isDirectory()) {
+      await removeMacOsMetadataEntries(entryPath);
+    }
   }
-  const inner = path.join(skillRoot, dirs[0].name);
-  if (!(await fileExists(path.join(inner, "SKILL.md")))) {
-    return;
+}
+
+async function moveDirectoryContentsToSkillRoot(
+  sourceDir: string,
+  skillRoot: string,
+): Promise<boolean> {
+  const entries = await fs.promises.readdir(sourceDir, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    const sourcePath = path.join(sourceDir, entry.name);
+    if (isMacOsMetadataEntry(entry.name)) {
+      await fs.promises.rm(sourcePath, { recursive: true, force: true }).catch(() => undefined);
+      continue;
+    }
+
+    const targetPath = path.join(skillRoot, entry.name);
+    if (entry.isDirectory() && path.resolve(targetPath) === path.resolve(sourceDir)) {
+      const nestedMoved = await moveDirectoryContentsToSkillRoot(sourcePath, skillRoot);
+      if (!nestedMoved) {
+        return false;
+      }
+      await fs.promises.rm(sourcePath, { recursive: true, force: true });
+      continue;
+    }
+
+    if (await fileExists(targetPath)) {
+      return false;
+    }
+    await fs.promises.rename(sourcePath, targetPath);
   }
-  for (const ent of await fs.promises.readdir(inner, { withFileTypes: true })) {
-    await fs.promises.rename(path.join(inner, ent.name), path.join(skillRoot, ent.name));
+  return true;
+}
+
+async function promoteSingleFolderSkillLayout(skillRoot: string): Promise<void> {
+  await removeMacOsMetadataEntries(skillRoot);
+
+  for (let depth = 0; depth < 8; depth += 1) {
+    const rootSkillMd = path.join(skillRoot, "SKILL.md");
+    if (await fileExists(rootSkillMd)) {
+      return;
+    }
+
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(skillRoot, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    const effectiveEntries = entries.filter((entry) => !isMacOsMetadataEntry(entry.name));
+    const dirs = effectiveEntries.filter((entry) => entry.isDirectory());
+    const files = effectiveEntries.filter((entry) => entry.isFile());
+    if (dirs.length !== 1 || files.length > 0) {
+      return;
+    }
+
+    const inner = path.join(skillRoot, dirs[0].name);
+    const moved = await moveDirectoryContentsToSkillRoot(inner, skillRoot);
+    if (!moved) {
+      return;
+    }
+    await fs.promises.rm(inner, { recursive: true, force: true });
+    await removeMacOsMetadataEntries(skillRoot);
   }
-  await fs.promises.rm(inner, { recursive: true, force: true });
 }
 
 export type ControlPlaneRegistryInstallOk = {
@@ -112,15 +173,19 @@ export type ControlPlaneRegistryInstallResult =
   | ControlPlaneRegistryInstallOk
   | ControlPlaneRegistryInstallErr;
 
-export async function installSkillPackageFromRegistryDownload(params: {
+type InstallPreparedArchiveParams = {
   workspaceDir: string;
-  downloadUrl: string;
+  archivePath: string;
   skillKey: string;
   artifactFormat?: string;
   expectedSha256?: string;
   stripComponents?: number;
   timeoutMs?: number;
-}): Promise<ControlPlaneRegistryInstallResult> {
+};
+
+async function installSkillPackageFromPreparedArchive(
+  params: InstallPreparedArchiveParams,
+): Promise<ControlPlaneRegistryInstallResult> {
   const skillKey = params.skillKey.trim();
   if (!SAFE_SKILL_KEY.test(skillKey)) {
     return { ok: false, message: "invalid skillKey" };
@@ -136,7 +201,7 @@ export async function installSkillPackageFromRegistryDownload(params: {
 
   const resolved = resolveArchiveTypeAndSuffix({
     artifactFormat: params.artifactFormat,
-    downloadUrl: params.downloadUrl.trim(),
+    downloadUrl: params.archivePath,
   });
   if (!resolved) {
     return {
@@ -157,40 +222,21 @@ export async function installSkillPackageFromRegistryDownload(params: {
       ? Math.max(0, Math.floor(params.stripComponents))
       : 0;
 
-  const tempPath = path.join(skillsRoot, `.registry-staging-${randomUUID()}${resolved.suffix}`);
-
   try {
     await ensureDir(skillsRoot);
-    const response = await proxyExternalHttpViaRuntimeAgent({
-      url: params.downloadUrl.trim(),
-      method: "GET",
-      timeoutMs,
-    });
-    if (!response.ok || !response.body) {
-      return {
-        ok: false,
-        message: `download failed (${response.status} ${response.statusText})`,
-      };
-    }
-    const body = response.body as unknown;
-    const readable = isNodeReadableStream(body)
-      ? body
-      : Readable.fromWeb(body as NodeReadableStream);
-    const file = fs.createWriteStream(tempPath);
-    await pipeline(readable, file);
 
-    const bytes = (await fs.promises.stat(tempPath)).size;
-    const sha256 = await hashFileSha256(tempPath);
+    const bytes = (await fs.promises.stat(params.archivePath)).size;
+    const sha256 = await hashFileSha256(params.archivePath);
     const expected = params.expectedSha256?.trim().toLowerCase();
     if (expected && sha256 !== expected) {
-      return { ok: false, message: "sha256 mismatch for downloaded artifact" };
+      return { ok: false, message: "sha256 mismatch for uploaded artifact" };
     }
 
     await fs.promises.rm(skillRoot, { recursive: true, force: true });
     await ensureDir(skillRoot);
 
     const extractResult = await extractArchive({
-      archivePath: tempPath,
+      archivePath: params.archivePath,
       archiveType: resolved.archiveType,
       targetDir: skillRoot,
       stripComponents: strip,
@@ -221,6 +267,124 @@ export async function installSkillPackageFromRegistryDownload(params: {
       bytes,
       sha256,
     };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, message };
+  }
+}
+
+export async function installSkillPackageFromRegistryDownload(params: {
+  workspaceDir: string;
+  downloadUrl: string;
+  skillKey: string;
+  artifactFormat?: string;
+  expectedSha256?: string;
+  stripComponents?: number;
+  timeoutMs?: number;
+}): Promise<ControlPlaneRegistryInstallResult> {
+  const resolved = resolveArchiveTypeAndSuffix({
+    artifactFormat: params.artifactFormat,
+    downloadUrl: params.downloadUrl.trim(),
+  });
+  if (!resolved) {
+    return {
+      ok: false,
+      message: "could not determine archive type; pass artifactFormat zip or tar_gz",
+    };
+  }
+
+  const timeoutMs =
+    typeof params.timeoutMs === "number" &&
+    Number.isFinite(params.timeoutMs) &&
+    params.timeoutMs > 0
+      ? Math.floor(params.timeoutMs)
+      : 120_000;
+
+  const strip =
+    typeof params.stripComponents === "number" && Number.isFinite(params.stripComponents)
+      ? Math.max(0, Math.floor(params.stripComponents))
+      : 0;
+
+  const workspaceResolved = path.resolve(params.workspaceDir);
+  const skillsRoot = path.join(workspaceResolved, "skills");
+  const tempPath = path.join(skillsRoot, `.registry-staging-${randomUUID()}${resolved.suffix}`);
+
+  try {
+    await ensureDir(skillsRoot);
+    const response = await proxyExternalHttpViaRuntimeAgent({
+      url: params.downloadUrl.trim(),
+      method: "GET",
+      timeoutMs,
+    });
+    if (!response.ok || !response.body) {
+      return {
+        ok: false,
+        message: `download failed (${response.status} ${response.statusText})`,
+      };
+    }
+    const body = response.body as unknown;
+    const readable = isNodeReadableStream(body)
+      ? body
+      : Readable.fromWeb(body as NodeReadableStream);
+    const file = fs.createWriteStream(tempPath);
+    await pipeline(readable, file);
+
+    return await installSkillPackageFromPreparedArchive({
+      workspaceDir: params.workspaceDir,
+      archivePath: tempPath,
+      skillKey: params.skillKey,
+      artifactFormat: params.artifactFormat,
+      expectedSha256: params.expectedSha256,
+      stripComponents: strip,
+      timeoutMs,
+    });
+  } finally {
+    await fs.promises.rm(tempPath, { force: true }).catch(() => undefined);
+  }
+}
+
+export async function installSkillPackageFromInlineArchive(params: {
+  workspaceDir: string;
+  archiveBase64: string;
+  archiveFileName?: string;
+  skillKey: string;
+  artifactFormat?: string;
+  expectedSha256?: string;
+  stripComponents?: number;
+  timeoutMs?: number;
+}): Promise<ControlPlaneRegistryInstallResult> {
+  const resolved = resolveArchiveTypeAndSuffix({
+    artifactFormat: params.artifactFormat,
+    downloadUrl: params.archiveFileName?.trim() || "",
+  });
+  if (!resolved) {
+    return {
+      ok: false,
+      message: "could not determine archive type for uploaded skill package",
+    };
+  }
+
+  const workspaceResolved = path.resolve(params.workspaceDir);
+  const skillsRoot = path.join(workspaceResolved, "skills");
+  const tempPath = path.join(skillsRoot, `.registry-inline-${randomUUID()}${resolved.suffix}`);
+
+  try {
+    await ensureDir(skillsRoot);
+    const archiveBuffer = Buffer.from(params.archiveBase64.trim(), "base64");
+    if (archiveBuffer.length === 0) {
+      return { ok: false, message: "uploaded archive is empty" };
+    }
+    await fs.promises.writeFile(tempPath, archiveBuffer);
+
+    return await installSkillPackageFromPreparedArchive({
+      workspaceDir: params.workspaceDir,
+      archivePath: tempPath,
+      skillKey: params.skillKey,
+      artifactFormat: params.artifactFormat,
+      expectedSha256: params.expectedSha256,
+      stripComponents: params.stripComponents,
+      timeoutMs: params.timeoutMs,
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { ok: false, message };

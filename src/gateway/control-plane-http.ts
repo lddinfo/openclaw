@@ -2137,6 +2137,34 @@ export async function handleControlPlaneHttpRequest(
     return true;
   }
 
+  const portalSessionStatusMatch = url.pathname.match(
+    new RegExp(`^${PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/portal/sessions/([^/]+)$`),
+  );
+  if (portalSessionStatusMatch) {
+    if (!ensureMethod(req, res, "GET")) {
+      return true;
+    }
+    const remoteSessionId = portalSessionStatusMatch[1] ?? "";
+    const session = portalSessions.get(remoteSessionId);
+    if (!session) {
+      sendJson(res, 404, { ok: false, error: "session not found", remoteSessionId });
+      return true;
+    }
+    sendJson(res, 200, {
+      ok: true,
+      remoteSessionId,
+      portalSessionId: session.portalSessionId ?? null,
+      remoteAgentId: session.remoteAgentId,
+      agentId: session.agentId,
+      mode: session.mode,
+      conversationView: session.conversationView,
+      runtimeRole: session.runtimeRole,
+      updatedAt: session.updatedAt,
+      turnCount: session.turnCount,
+    });
+    return true;
+  }
+
   const portalMessagesMatch = url.pathname.match(
     new RegExp(
       `^${PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/portal/sessions/([^/]+)/messages$`,

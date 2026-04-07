@@ -9,6 +9,7 @@ import {
   resolveAgentWorkspaceDir,
   resolveDefaultAgentId,
 } from "../agents/agent-scope.js";
+import { bumpSkillsSnapshotVersion } from "../agents/skills/refresh-state.js";
 import {
   DEFAULT_AGENTS_FILENAME,
   DEFAULT_IDENTITY_FILENAME,
@@ -504,13 +505,15 @@ function buildPlatformDefaultSkillFiles(): Array<{ name: string; content: string
       name: `skills/${PLATFORM_DEFAULT_FIND_SKILL_NAME}/SKILL.md`,
       content: `---
 name: find-base-skills
-description: 优先从当前基座 Skill 仓库中搜索、推荐并安装 Skill；内部无结果时，先征求用户是否允许外部查询。
+description: 先检查当前 workspace 已安装的 skills；本地没有合适 Skill 时，再从当前基座 Skill 仓库搜索、推荐并安装；内部无结果时，先征求用户是否允许外部查询。
 ---
 
 # Find Base Skills
 
-优先使用 \`skill_registry_search\` 搜索当前基座 Skill 仓库。
+先检查当前 workspace 已安装的 skills 是否已经满足需求。
 
+- 当前 workspace 已有合适 Skill 时：直接优先使用本地 Skill，不要先跳去内部仓库搜索
+- 当前 workspace 没有合适 Skill 时：再使用 \`skill_registry_search\` 搜索当前基座 Skill 仓库
 - 找到内部 Skill 时：先推荐候选版本与用途，得到确认后再调用 \`skill_registry_install\`
 - 安装内部 Skill 时：不要使用 \`openclaw skills install ...\`、\`npx\`、\`curl\`、\`bash\` 或其他 shell 命令；那样会绕过基座仓库并可能回落到 ClawHub
 - 内部 Skill 无结果时：先询问用户是否允许外部查询
@@ -817,7 +820,8 @@ function buildPortalExtraSystemPrompt(params: {
       "",
       "Training view is enabled. Candidate changes may be proposed as draft runtime state, but nothing is published until the control-plane explicitly approves and releases it.",
       `The workspace already includes the platform skill ${PLATFORM_DEFAULT_FIND_SKILL_NAME}.`,
-      "When the user asks for existing capabilities, integrations, or reusable automation, search the skill registry first with skill_registry_search.",
+      "When the user asks for existing capabilities, integrations, or reusable automation, check the currently installed workspace skills first.",
+      "Only if the current workspace does not already contain a suitable skill should you search the internal skill registry with skill_registry_search.",
       "Before calling skill_registry_install, summarize the candidate skill and get explicit user confirmation in chat.",
       "Never install internal skills via exec, shell, or `openclaw skills install`; that path may bypass the control-plane registry and fall back to local/default sources such as ClawHub.",
       params.session.externalSkillLookupAllowed === true
@@ -848,15 +852,16 @@ function buildPortalExtraSystemPrompt(params: {
           }),
         );
         lines.push(
-          "Use these internal results first. Recommend the best 1-3 candidates and ask the user to confirm a specific skill/version before installation.",
+          "Treat these as fallback internal candidates. Use them only after checking that the current workspace does not already have a suitable installed skill.",
+          "If no suitable local skill exists, recommend the best 1-3 internal candidates and ask the user to confirm a specific skill/version before installation.",
         );
       } else if (params.skillSearchPrefetch.externalLookupAllowed) {
         lines.push(
-          "The internal registry returned no match. Tell the user that no internal skill was found; external skill lookup is now allowed if it helps.",
+          "The internal registry returned no match. After confirming no suitable local workspace skill exists, tell the user that no internal skill was found; external skill lookup is now allowed if it helps.",
         );
       } else {
         lines.push(
-          "The internal registry returned no match. Do not query external skill sources yet. Reply that no internal skill was found and ask whether the user allows external skill lookup.",
+          "The internal registry returned no match. After confirming no suitable local workspace skill exists, do not query external skill sources yet. Reply that no internal skill was found and ask whether the user allows external skill lookup.",
         );
       }
     }
@@ -1852,6 +1857,11 @@ export async function handleControlPlaneHttpRequest(
       sendJson(res, 400, { error: result.message });
       return true;
     }
+    bumpSkillsSnapshotVersion({
+      workspaceDir,
+      reason: "manual",
+      changedPath: result.installedPath,
+    });
     sendJson(res, 200, {
       ok: true,
       agentId,

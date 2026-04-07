@@ -1,7 +1,8 @@
-import { buildPluginApprovalPendingReplyPayload } from "openclaw/plugin-sdk/approval-runtime";
+import { buildPluginApprovalPendingReplyPayload } from "openclaw/plugin-sdk/approval-reply-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
 import {
   createChannelNativeApprovalRuntime,
+  resolveExecApprovalRequestAllowedDecisions,
   type ExecApprovalChannelRuntime,
 } from "openclaw/plugin-sdk/infra-runtime";
 import { resolveExecApprovalCommandDisplay } from "openclaw/plugin-sdk/infra-runtime";
@@ -20,8 +21,7 @@ import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 import { telegramNativeApprovalAdapter } from "./approval-native.js";
 import { resolveTelegramInlineButtons } from "./button-types.js";
 import {
-  getTelegramExecApprovalApprovers,
-  resolveTelegramExecApprovalConfig,
+  isTelegramExecApprovalHandlerConfigured,
   shouldHandleTelegramExecApprovalRequest,
 } from "./exec-approvals.js";
 import { editMessageReplyMarkupTelegram, sendMessageTelegram, sendTypingTelegram } from "./send.js";
@@ -55,19 +55,7 @@ export type TelegramExecApprovalHandlerDeps = {
 };
 
 function isHandlerConfigured(params: { cfg: OpenClawConfig; accountId: string }): boolean {
-  const config = resolveTelegramExecApprovalConfig({
-    cfg: params.cfg,
-    accountId: params.accountId,
-  });
-  if (!config?.enabled) {
-    return false;
-  }
-  return (
-    getTelegramExecApprovalApprovers({
-      cfg: params.cfg,
-      accountId: params.accountId,
-    }).length > 0
-  );
+  return isTelegramExecApprovalHandlerConfigured(params);
 }
 
 export class TelegramExecApprovalHandler {
@@ -88,9 +76,7 @@ export class TelegramExecApprovalHandler {
     this.runtime = createChannelNativeApprovalRuntime<
       PendingMessage,
       { chatId: string; messageThreadId?: number },
-      TelegramPendingDelivery,
-      ApprovalRequest,
-      ApprovalResolved
+      TelegramPendingDelivery
     >({
       label: "telegram/exec-approvals",
       clientDisplayName: `Telegram Exec Approvals (${this.opts.accountId})`,
@@ -124,6 +110,9 @@ export class TelegramExecApprovalHandler {
                 cwd: (request as ExecApprovalRequest).request.cwd ?? undefined,
                 host: (request as ExecApprovalRequest).request.host === "node" ? "node" : "gateway",
                 nodeId: (request as ExecApprovalRequest).request.nodeId ?? undefined,
+                allowedDecisions: resolveExecApprovalRequestAllowedDecisions(
+                  (request as ExecApprovalRequest).request,
+                ),
                 expiresAtMs: request.expiresAtMs,
                 nowMs,
               } satisfies ExecApprovalPendingReplyParams);

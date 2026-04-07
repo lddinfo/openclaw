@@ -1,4 +1,5 @@
 import type { ReplyPayload } from "../runtime-api.js";
+import { formatUnknownError } from "./errors.js";
 import type { MSTeamsMonitorLogger } from "./monitor-types.js";
 import type { MSTeamsTurnContext } from "./sdk-types.js";
 import { TeamsHttpStream } from "./streaming-message.js";
@@ -12,7 +13,7 @@ const INFORMATIVE_STATUS_TEXTS = [
 
 export function pickInformativeStatusText(random = Math.random): string {
   const index = Math.floor(random() * INFORMATIVE_STATUS_TEXTS.length);
-  return INFORMATIVE_STATUS_TEXTS[index] ?? INFORMATIVE_STATUS_TEXTS[0]!;
+  return INFORMATIVE_STATUS_TEXTS[index] ?? INFORMATIVE_STATUS_TEXTS[0];
 }
 
 export function createTeamsReplyStreamController(params: {
@@ -28,7 +29,7 @@ export function createTeamsReplyStreamController(params: {
         sendActivity: (activity) => params.context.sendActivity(activity),
         feedbackLoopEnabled: params.feedbackLoopEnabled,
         onError: (err) => {
-          params.log.debug?.(`stream error: ${err instanceof Error ? err.message : String(err)}`);
+          params.log.debug?.(`stream error: ${formatUnknownError(err)}`);
         },
       })
     : undefined;

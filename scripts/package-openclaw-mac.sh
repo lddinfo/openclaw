@@ -19,6 +19,8 @@ PACKAGE_DIR="${OUT_DIR}/packages"
 LOCAL_PACKAGE_TGZ=""
 LOCAL_PACKAGE_PATH=""
 BUNDLE_ENV_PATH="${OUT_DIR}/.openclaw/.env"
+SOURCE_HOME_FOR_REWRITE="${HOME}"
+SOURCE_OPENCLAW_HOME="${OPENCLAW_HOME}"
 
 echo "Packing OpenClaw runtime profile from: ${OPENCLAW_HOME}"
 echo "Bundling config JSON from: ${OPENCLAW_MAC_PROFILE_SOURCE}"
@@ -253,21 +255,19 @@ To import on a target Mac:
    cd ~
    tar -xzf /path/to/${OUT_TAR}
 
-3. Install THIS local OpenClaw build globally:
+3. Run the bundled installer:
 
-   npm install -g ~/${OUT_BASENAME}/packages/${LOCAL_PACKAGE_TGZ}
+   bash ~/${OUT_BASENAME}/install-local-openclaw.sh
 
-4. Restore the runtime profile:
+4. What the installer does:
 
-   mkdir -p ~/.openclaw/workspace
-   sed "s#__OPENCLAW_HOME__#\$HOME/.openclaw#g" ~/${OUT_BASENAME}/.openclaw/.env > ~/.openclaw/.env
-   cp ~/${OUT_BASENAME}/.openclaw/openclaw.json ~/.openclaw/openclaw.json
-   cp ~/${OUT_BASENAME}/.openclaw/exec-approvals.json ~/.openclaw/exec-approvals.json
-   cp ~/${OUT_BASENAME}/.openclaw/workspace/SOUL.md ~/.openclaw/workspace/SOUL.md
-
-   # Do NOT overwrite ~/.openclaw/control-plane-state.json during upgrades.
-   # Keep the target machine's existing file so synced remoteAgentId/localAgentKey
-   # mappings survive package updates.
+   - installs THIS local OpenClaw build globally
+   - restores ~/.openclaw/.env with \$HOME/.openclaw substituted in place of __OPENCLAW_HOME__
+   - merges ~/.openclaw/openclaw.json instead of blindly overwriting it
+   - preserves the target Mac's existing agents.list
+   - rewrites source-machine /Users/... paths to the target \$HOME
+   - copies exec-approvals.json and SOUL.md
+   - preserves the target Mac's existing ~/.openclaw/control-plane-state.json
 
 5. Choose how you want to run the Gateway:
 
@@ -316,8 +316,179 @@ PACKAGE_NAME="${LOCAL_PACKAGE_TGZ}"
 mkdir -p "\$HOME/.openclaw/workspace"
 npm install -g "\${BUNDLE_DIR}/packages/\${PACKAGE_NAME}"
 
+GLOBAL_NPM_ROOT="\$(npm root -g)"
+INSTALLED_OPENCLAW_ROOT="\${GLOBAL_NPM_ROOT}/openclaw"
+python3 - "\${BUNDLE_DIR}/packages/\${PACKAGE_NAME}" "\${INSTALLED_OPENCLAW_ROOT}" <<'PY'
+import json
+import pathlib
+import shutil
+import sys
+import tarfile
+import tempfile
+
+bundle_tgz = pathlib.Path(sys.argv[1])
+installed_root = pathlib.Path(sys.argv[2])
+
+def collect_runtime_closure(node_modules_dir: pathlib.Path, dependency_specs: dict[str, str]) -> list[str] | None:
+    package_cache: dict[str, dict] = {}
+    closure: set[str] = set()
+    queue = list(dependency_specs.keys())
+
+    while queue:
+        dep_name = queue.pop(0)
+        if dep_name in closure:
+            continue
+        dep_package_json = node_modules_dir.joinpath(*dep_name.split("/"), "package.json")
+        if not dep_package_json.exists():
+            return None
+        package_json = package_cache.get(dep_name)
+        if package_json is None:
+            package_json = json.loads(dep_package_json.read_text(encoding="utf-8"))
+            package_cache[dep_name] = package_json
+        closure.add(dep_name)
+        for child_name in {
+            **package_json.get("dependencies", {}),
+            **package_json.get("optionalDependencies", {}),
+        }:
+            if child_name not in closure:
+                queue.append(child_name)
+
+    return sorted(closure)
+
+with tempfile.TemporaryDirectory(prefix="openclaw-runtime-bundle-") as tmp_dir:
+    with tarfile.open(bundle_tgz, "r:gz") as archive:
+        archive.extractall(tmp_dir)
+
+    packaged_root = pathlib.Path(tmp_dir) / "package"
+    packaged_extensions_root = packaged_root / "dist" / "extensions"
+    installed_node_modules = installed_root / "node_modules"
+
+    if packaged_extensions_root.exists():
+        for plugin_dir in sorted(packaged_extensions_root.iterdir()):
+            if not plugin_dir.is_dir():
+                continue
+            manifest_path = plugin_dir / "package.json"
+            staged_node_modules = plugin_dir / "node_modules"
+            if not manifest_path.exists() or not staged_node_modules.exists():
+                continue
+
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if manifest.get("openclaw", {}).get("bundle", {}).get("stageRuntimeDependencies") is not True:
+                continue
+
+            runtime_deps = {
+                **manifest.get("dependencies", {}),
+                **manifest.get("optionalDependencies", {}),
+            }
+            if not runtime_deps:
+                continue
+
+            dependency_names = collect_runtime_closure(staged_node_modules, runtime_deps)
+            if dependency_names is None:
+                continue
+
+            for dep_name in dependency_names:
+                target_package_json = installed_node_modules.joinpath(*dep_name.split("/"), "package.json")
+                if target_package_json.exists():
+                    continue
+                source_path = staged_node_modules.joinpath(*dep_name.split("/"))
+                if not source_path.exists():
+                    continue
+                target_path = installed_node_modules.joinpath(*dep_name.split("/"))
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(source_path, target_path, dirs_exist_ok=True)
+PY
+if [ -f "\${INSTALLED_OPENCLAW_ROOT}/scripts/postinstall-bundled-plugins.mjs" ]; then
+  node "\${INSTALLED_OPENCLAW_ROOT}/scripts/postinstall-bundled-plugins.mjs"
+fi
+python3 - "\${INSTALLED_OPENCLAW_ROOT}" <<'PY'
+import json
+import pathlib
+import sys
+
+package_root = pathlib.Path(sys.argv[1])
+extensions_root = package_root / "dist" / "extensions"
+root_node_modules = package_root / "node_modules"
+missing = []
+
+if extensions_root.exists():
+    for plugin_dir in sorted(extensions_root.iterdir()):
+        if not plugin_dir.is_dir():
+            continue
+        manifest_path = plugin_dir / "package.json"
+        if not manifest_path.exists():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if manifest.get("openclaw", {}).get("bundle", {}).get("stageRuntimeDependencies") is not True:
+            continue
+        runtime_deps = {
+            **manifest.get("dependencies", {}),
+            **manifest.get("optionalDependencies", {}),
+        }
+        for dep_name in sorted(runtime_deps):
+            dep_path = root_node_modules.joinpath(*dep_name.split("/"), "package.json")
+            if not dep_path.exists():
+                missing.append(f"{plugin_dir.name}:{dep_name}")
+
+if missing:
+    raise SystemExit(
+        "Bundled plugin runtime dependencies are still missing after install: " + ", ".join(missing)
+    )
+PY
+
 if [ -f "\${BUNDLE_DIR}/.openclaw/openclaw.json" ]; then
-  cp "\${BUNDLE_DIR}/.openclaw/openclaw.json" "\$HOME/.openclaw/openclaw.json"
+  python3 - "\${BUNDLE_DIR}/.openclaw/openclaw.json" "\$HOME/.openclaw/openclaw.json" "\$HOME" "${SOURCE_OPENCLAW_HOME}" "${SOURCE_HOME_FOR_REWRITE}" <<'PY'
+import json
+import pathlib
+import sys
+
+bundle_path = pathlib.Path(sys.argv[1])
+target_path = pathlib.Path(sys.argv[2])
+target_home = sys.argv[3]
+source_openclaw_home = sys.argv[4]
+source_home = sys.argv[5]
+target_openclaw_home = str(pathlib.Path(target_home) / ".openclaw")
+
+def rewrite_value(value):
+    if isinstance(value, str):
+        out = value
+        if source_openclaw_home:
+            out = out.replace(source_openclaw_home, target_openclaw_home)
+        if source_home:
+            out = out.replace(source_home, target_home)
+        return out
+    if isinstance(value, list):
+        return [rewrite_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: rewrite_value(item) for key, item in value.items()}
+    return value
+
+bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+bundle = rewrite_value(bundle)
+
+if target_path.exists():
+    try:
+        existing = json.loads(target_path.read_text(encoding="utf-8"))
+    except Exception:
+        existing = None
+    if isinstance(existing, dict):
+        existing_agents = existing.get("agents")
+        existing_list = existing_agents.get("list") if isinstance(existing_agents, dict) else None
+        if isinstance(existing_list, list):
+            bundle_agents = bundle.get("agents")
+            if not isinstance(bundle_agents, dict):
+                bundle_agents = {}
+                bundle["agents"] = bundle_agents
+            bundle_agents["list"] = existing_list
+
+target_path.write_text(
+    json.dumps(bundle, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
 fi
 if [ -f "\${BUNDLE_DIR}/.openclaw/exec-approvals.json" ]; then
   cp "\${BUNDLE_DIR}/.openclaw/exec-approvals.json" "\$HOME/.openclaw/exec-approvals.json"
@@ -379,6 +550,9 @@ PY
 fi
 
 echo "Installed local OpenClaw package: \${PACKAGE_NAME}"
+echo "Merged ~/.openclaw/openclaw.json:"
+echo "  - preserved target machine agents.list"
+echo "  - rewrote source-machine home paths to \$HOME"
 echo "Next:"
 echo "  Foreground run:"
 echo "    export OPENCLAW_BRIDGE_TOKEN=<same token as control plane>"

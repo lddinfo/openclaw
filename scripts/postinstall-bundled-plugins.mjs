@@ -4,7 +4,7 @@
 // so runtime dependencies declared in dist/extensions/*/package.json must also
 // resolve from the package root node_modules. Skip source checkouts.
 import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { resolveNpmRunner } from "./npm-runner.mjs";
@@ -24,11 +24,115 @@ function dependencySentinelPath(depName) {
   return join("node_modules", ...depName.split("/"), "package.json");
 }
 
+function dependencyNodeModulesPath(nodeModulesDir, depName) {
+  return join(nodeModulesDir, ...depName.split("/"));
+}
+
 function collectRuntimeDeps(packageJson) {
   return {
     ...packageJson.dependencies,
     ...packageJson.optionalDependencies,
   };
+}
+
+function collectInstalledRuntimeClosure(params) {
+  const nodeModulesDir = params.nodeModulesDir;
+  const dependencySpecs = params.dependencySpecs;
+  const pathExists = params.existsSync ?? existsSync;
+  const readJsonFile = params.readJson ?? readJson;
+  const packageCache = new Map();
+  const closure = new Set();
+  const queue = Object.entries(dependencySpecs);
+
+  while (queue.length > 0) {
+    const [depName] = queue.shift();
+    if (closure.has(depName)) {
+      continue;
+    }
+
+    const packageJsonPath = join(
+      dependencyNodeModulesPath(nodeModulesDir, depName),
+      "package.json",
+    );
+    if (!pathExists(packageJsonPath)) {
+      return null;
+    }
+
+    const packageJson = packageCache.get(depName) ?? readJsonFile(packageJsonPath);
+    packageCache.set(depName, packageJson);
+    closure.add(depName);
+
+    for (const [childName, childSpec] of Object.entries(collectRuntimeDeps(packageJson))) {
+      queue.push([childName, childSpec]);
+    }
+  }
+
+  return [...closure].toSorted((a, b) => a.localeCompare(b));
+}
+
+function restoreBundledPluginRuntimeDepsFromPayload(params) {
+  const extensionsDir = params.extensionsDir ?? DEFAULT_EXTENSIONS_DIR;
+  const packageRoot = params.packageRoot ?? DEFAULT_PACKAGE_ROOT;
+  const pathExists = params.existsSync ?? existsSync;
+  const readDir = params.readdirSync ?? readdirSync;
+  const readJsonFile = params.readJson ?? readJson;
+  const restored = new Set();
+
+  if (!pathExists(extensionsDir)) {
+    return [];
+  }
+
+  for (const entry of readDir(extensionsDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+
+    const pluginDir = join(extensionsDir, entry.name);
+    const packageJsonPath = join(pluginDir, "package.json");
+    const stagedNodeModulesDir = join(pluginDir, "node_modules");
+    if (!pathExists(packageJsonPath) || !pathExists(stagedNodeModulesDir)) {
+      continue;
+    }
+
+    let packageJson;
+    try {
+      packageJson = readJsonFile(packageJsonPath);
+    } catch {
+      continue;
+    }
+
+    const dependencySpecs = collectRuntimeDeps(packageJson);
+    if (Object.keys(dependencySpecs).length === 0) {
+      continue;
+    }
+
+    const dependencyNames = collectInstalledRuntimeClosure({
+      nodeModulesDir: stagedNodeModulesDir,
+      dependencySpecs,
+      existsSync: pathExists,
+      readJson: readJsonFile,
+    });
+    if (dependencyNames === null) {
+      continue;
+    }
+
+    for (const depName of dependencyNames) {
+      const sentinelPath = join(packageRoot, dependencySentinelPath(depName));
+      if (pathExists(sentinelPath)) {
+        continue;
+      }
+      const sourcePath = dependencyNodeModulesPath(stagedNodeModulesDir, depName);
+      if (!pathExists(sourcePath)) {
+        continue;
+      }
+      const targetPath = join(packageRoot, "node_modules", ...depName.split("/"));
+      mkdirSync(dirname(targetPath), { recursive: true });
+      cpSync(sourcePath, targetPath, { recursive: true, force: true, dereference: true });
+      restored.add(depName);
+    }
+  }
+
+  return [...restored].toSorted((a, b) => a.localeCompare(b));
 }
 
 export function discoverBundledPluginRuntimeDeps(params = {}) {
@@ -140,6 +244,16 @@ export function runBundledPluginPostinstall(params = {}) {
     })
   ) {
     return;
+  }
+  const restoredSpecs = restoreBundledPluginRuntimeDepsFromPayload({
+    extensionsDir,
+    packageRoot,
+    existsSync: pathExists,
+  });
+  if (restoredSpecs.length > 0) {
+    log.log(
+      `[postinstall] restored bundled plugin deps from packaged payload: ${restoredSpecs.join(", ")}`,
+    );
   }
   const runtimeDeps =
     params.runtimeDeps ??

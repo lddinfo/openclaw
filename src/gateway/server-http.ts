@@ -11,9 +11,9 @@ import type { WebSocketServer } from "ws";
 import { resolveAgentAvatar } from "../agents/identity-avatar.js";
 import { CANVAS_WS_PATH, handleA2uiHttpRequest } from "../canvas-host/a2ui.js";
 import type { CanvasHostHandler } from "../canvas-host/server.js";
+import { listBundledChannelPlugins } from "../channels/plugins/bundled.js";
 import { loadConfig } from "../config/config.js";
 import type { createSubsystemLogger } from "../logging/subsystem.js";
-import { handleSlackHttpRequest } from "../plugin-sdk/slack.js";
 import { resolveHookExternalContentSource as resolveHookExternalContentSourceFromSession } from "../security/external-content.js";
 import { safeEqualSecret } from "../security/secret-equal.js";
 import {
@@ -58,17 +58,18 @@ import {
   resolveHookDeliver,
 } from "./hooks.js";
 import { sendGatewayAuthFailure, setDefaultSecurityHeaders } from "./http-common.js";
-import { getBearerToken, resolveHttpBrowserOriginPolicy } from "./http-utils.js";
+import {
+  authorizeGatewayHttpRequestOrReply,
+  getBearerToken,
+  resolveHttpBrowserOriginPolicy,
+} from "./http-utils.js";
 import { handleOpenAiModelsHttpRequest } from "./models-http.js";
 import { resolveRequestClientIp } from "./net.js";
 import { handleOpenAiHttpRequest } from "./openai-http.js";
 import { handleOpenResponsesHttpRequest } from "./openresponses-http.js";
 import { DEDUPE_MAX, DEDUPE_TTL_MS } from "./server-constants.js";
-import {
-  authorizeCanvasRequest,
-  enforcePluginRouteGatewayAuth,
-  isCanvasPath,
-} from "./server/http-auth.js";
+import { authorizeCanvasRequest, isCanvasPath } from "./server/http-auth.js";
+import { resolvePluginRouteRuntimeOperatorScopes } from "./server/plugin-route-runtime-scopes.js";
 import {
   isProtectedPluginRoutePathFromContext,
   resolvePluginRoutePathContext,
@@ -134,62 +135,19 @@ const GATEWAY_PROBE_STATUS_BY_PATH = new Map<string, "live" | "ready">([
   ["/ready", "ready"],
   ["/readyz", "ready"],
 ]);
-const MATTERMOST_SLASH_CALLBACK_PATH = "/api/channels/mattermost/command";
-
-function resolveMattermostSlashCallbackPaths(
+function resolvePluginGatewayAuthBypassPaths(
   configSnapshot: ReturnType<typeof loadConfig>,
 ): Set<string> {
-  const callbackPaths = new Set<string>([MATTERMOST_SLASH_CALLBACK_PATH]);
-  const isMattermostCommandCallbackPath = (path: string): boolean =>
-    path === MATTERMOST_SLASH_CALLBACK_PATH || path.startsWith("/api/channels/mattermost/");
-
-  const normalizeCallbackPath = (value: unknown): string => {
-    const trimmed = typeof value === "string" ? value.trim() : "";
-    if (!trimmed) {
-      return MATTERMOST_SLASH_CALLBACK_PATH;
-    }
-    return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
-  };
-
-  const tryAddCallbackUrlPath = (rawUrl: unknown) => {
-    if (typeof rawUrl !== "string") {
-      return;
-    }
-    const trimmed = rawUrl.trim();
-    if (!trimmed) {
-      return;
-    }
-    try {
-      const pathname = new URL(trimmed).pathname;
-      if (pathname && isMattermostCommandCallbackPath(pathname)) {
-        callbackPaths.add(pathname);
+  const paths = new Set<string>();
+  for (const plugin of listBundledChannelPlugins()) {
+    for (const path of plugin.gateway?.resolveGatewayAuthBypassPaths?.({ cfg: configSnapshot }) ??
+      []) {
+      if (typeof path === "string" && path.trim()) {
+        paths.add(path.trim());
       }
-    } catch {
-      // Ignore invalid callback URLs in config and keep default path behavior.
     }
-  };
-
-  const mmRaw = configSnapshot.channels?.mattermost as Record<string, unknown> | undefined;
-  const addMmCommands = (raw: unknown) => {
-    if (raw == null || typeof raw !== "object") {
-      return;
-    }
-    const commands = raw as Record<string, unknown>;
-    const callbackPath = normalizeCallbackPath(commands.callbackPath);
-    if (isMattermostCommandCallbackPath(callbackPath)) {
-      callbackPaths.add(callbackPath);
-    }
-    tryAddCallbackUrlPath(commands.callbackUrl);
-  };
-
-  addMmCommands(mmRaw?.commands);
-  const accountsRaw = (mmRaw?.accounts ?? {}) as Record<string, unknown>;
-  for (const accountId of Object.keys(accountsRaw)) {
-    const accountCfg = accountsRaw[accountId] as Record<string, unknown> | undefined;
-    addMmCommands(accountCfg?.commands);
   }
-
-  return callbackPaths;
+  return paths;
 }
 
 function shouldEnforceDefaultPluginGatewayAuth(pathContext: PluginRoutePathContext): boolean {
@@ -326,9 +284,8 @@ export async function runGatewayHttpRequestStages(
     } catch (err) {
       // Log and skip the failing stage so subsequent stages (control-ui,
       // gateway-probes, etc.) remain reachable.  A common trigger is a
-      // bundled-plugin facade that fails to load because an optional
-      // dependency is missing (e.g. @slack/bolt after the lazy-facade
-      // refactor).
+      // plugin-owned route/runtime code can still fail to load when an
+      // optional dependency is missing. Keep later stages reachable.
       console.error(`[gateway-http] stage "${stage.name}" threw — skipping:`, err);
     }
   }
@@ -339,7 +296,7 @@ function buildPluginRequestStages(params: {
   req: IncomingMessage;
   res: ServerResponse;
   requestPath: string;
-  mattermostSlashCallbackPaths: ReadonlySet<string>;
+  gatewayAuthBypassPaths: ReadonlySet<string>;
   pluginPathContext: PluginRoutePathContext | null;
   handlePluginRequest?: PluginHttpRequestHandler;
   shouldEnforcePluginGatewayAuth?: (pathContext: PluginRoutePathContext) => boolean;
@@ -352,11 +309,12 @@ function buildPluginRequestStages(params: {
     return [];
   }
   let pluginGatewayAuthSatisfied = false;
+  let pluginRequestOperatorScopes: string[] | undefined;
   return [
     {
       name: "plugin-auth",
       run: async () => {
-        if (params.mattermostSlashCallbackPaths.has(params.requestPath)) {
+        if (params.gatewayAuthBypassPaths.has(params.requestPath)) {
           return false;
         }
         const pathContext =
@@ -368,7 +326,7 @@ function buildPluginRequestStages(params: {
         ) {
           return false;
         }
-        const pluginAuthOk = await enforcePluginRouteGatewayAuth({
+        const requestAuth = await authorizeGatewayHttpRequestOrReply({
           req: params.req,
           res: params.res,
           auth: params.resolvedAuth,
@@ -376,10 +334,14 @@ function buildPluginRequestStages(params: {
           allowRealIpFallback: params.allowRealIpFallback,
           rateLimiter: params.rateLimiter,
         });
-        if (!pluginAuthOk) {
+        if (!requestAuth) {
           return true;
         }
         pluginGatewayAuthSatisfied = true;
+        pluginRequestOperatorScopes = resolvePluginRouteRuntimeOperatorScopes(
+          params.req,
+          requestAuth,
+        );
         return false;
       },
     },
@@ -391,6 +353,7 @@ function buildPluginRequestStages(params: {
         return (
           params.handlePluginRequest?.(params.req, params.res, pathContext, {
             gatewayAuthSatisfied: pluginGatewayAuthSatisfied,
+            gatewayRequestOperatorScopes: pluginRequestOperatorScopes,
           }) ?? false
         );
       },
@@ -836,7 +799,7 @@ export function createGatewayHttpServer(opts: {
         req.url = scopedCanvas.rewrittenUrl;
       }
       const requestPath = new URL(req.url ?? "/", "http://localhost").pathname;
-      const mattermostSlashCallbackPaths = resolveMattermostSlashCallbackPaths(configSnapshot);
+      const gatewayAuthBypassPaths = resolvePluginGatewayAuthBypassPaths(configSnapshot);
       const pluginPathContext = handlePluginRequest
         ? resolvePluginRoutePathContext(requestPath)
         : null;
@@ -898,10 +861,6 @@ export function createGatewayHttpServer(opts: {
               allowRealIpFallback,
               rateLimiter,
             }),
-        },
-        {
-          name: "slack",
-          run: () => handleSlackHttpRequest(req, res),
         },
       ];
       if (openResponsesEnabled) {
@@ -971,7 +930,7 @@ export function createGatewayHttpServer(opts: {
           req,
           res,
           requestPath,
-          mattermostSlashCallbackPaths,
+          gatewayAuthBypassPaths,
           pluginPathContext,
           handlePluginRequest,
           shouldEnforcePluginGatewayAuth,
@@ -994,7 +953,8 @@ export function createGatewayHttpServer(opts: {
           run: () =>
             handleControlUiAvatarRequest(req, res, {
               basePath: controlUiBasePath,
-              resolveAvatar: (agentId) => resolveAgentAvatar(configSnapshot, agentId),
+              resolveAvatar: (agentId) =>
+                resolveAgentAvatar(configSnapshot, agentId, { includeUiOverride: true }),
             }),
         });
         requestStages.push({

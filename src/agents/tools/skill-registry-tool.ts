@@ -3,6 +3,7 @@ import { loadControlPlaneRuntimeState } from "../../gateway/control-plane-runtim
 import { installSkillPackageFromRegistryDownload } from "../../gateway/control-plane-skill-install.js";
 import {
   buildRuntimeAgentContext,
+  readControlPlaneBaseUrl,
   recommendSkillsFromControlPlane,
   requestControlPlaneJson,
 } from "../../gateway/control-plane-skill-registry.js";
@@ -81,10 +82,24 @@ export function createSkillRegistryInstallTool(opts?: { workspaceDir?: string })
         reason: "portal training skill install",
       });
 
-      const downloadUrl =
+      let downloadUrl =
         typeof ticket.downloadUrl === "string" && ticket.downloadUrl.trim()
           ? ticket.downloadUrl.trim()
           : undefined;
+      if (!downloadUrl) {
+        const downloadPath =
+          typeof ticket.downloadPath === "string" && ticket.downloadPath.trim()
+            ? ticket.downloadPath.trim()
+            : undefined;
+        if (downloadPath) {
+          const baseUrl = readControlPlaneBaseUrl();
+          try {
+            downloadUrl = new URL(downloadPath, baseUrl).toString();
+          } catch {
+            downloadUrl = `${baseUrl.replace(/\/+$/, "")}${downloadPath}`;
+          }
+        }
+      }
       const resolvedSkillKey =
         (typeof ticket.skillKey === "string" && ticket.skillKey.trim()
           ? ticket.skillKey.trim()

@@ -262,11 +262,11 @@ To import on a target Mac:
 4. What the installer does:
 
    - installs THIS local OpenClaw build globally
-   - restores ~/.openclaw/.env with \$HOME/.openclaw substituted in place of __OPENCLAW_HOME__
-   - merges ~/.openclaw/openclaw.json instead of blindly overwriting it
-   - preserves the target Mac's existing agents.list
-   - rewrites source-machine /Users/... paths to the target \$HOME
-   - copies exec-approvals.json and SOUL.md
+   - prompts before overwriting existing ~/.openclaw/.env, ~/.openclaw/openclaw.json, and ~/.openclaw/exec-approvals.json
+   - when replacing ~/.openclaw/.env, substitutes \$HOME/.openclaw in place of __OPENCLAW_HOME__
+   - when replacing ~/.openclaw/openclaw.json, preserves the target Mac's existing agents.list
+   - when replacing ~/.openclaw/openclaw.json, rewrites source-machine /Users/... paths to the target \$HOME
+   - copies SOUL.md
    - preserves the target Mac's existing ~/.openclaw/control-plane-state.json
 
 5. Choose how you want to run the Gateway:
@@ -313,6 +313,34 @@ set -euo pipefail
 BUNDLE_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
 PACKAGE_NAME="${LOCAL_PACKAGE_TGZ}"
 
+prompt_overwrite_file() {
+  local target_path="\$1"
+  local label="\$2"
+  if [ ! -e "\${target_path}" ]; then
+    return 0
+  fi
+  if [ ! -t 0 ]; then
+    echo "Preserving existing \${label} (non-interactive install)." >&2
+    return 1
+  fi
+  while true; do
+    printf 'Overwrite existing %s? [y/N] ' "\${label}" >&2
+    IFS= read -r reply || return 1
+    case "\${reply}" in
+      [Yy]|[Yy][Ee][Ss])
+        return 0
+        ;;
+      ""|[Nn]|[Nn][Oo])
+        echo "Preserving existing \${label}." >&2
+        return 1
+        ;;
+      *)
+        echo "Please answer y or n." >&2
+        ;;
+    esac
+  done
+}
+
 mkdir -p "\$HOME/.openclaw/workspace"
 npm install -g "\${BUNDLE_DIR}/packages/\${PACKAGE_NAME}"
 
@@ -329,9 +357,9 @@ import tempfile
 bundle_tgz = pathlib.Path(sys.argv[1])
 installed_root = pathlib.Path(sys.argv[2])
 
-def collect_runtime_closure(node_modules_dir: pathlib.Path, dependency_specs: dict[str, str]) -> list[str] | None:
-    package_cache: dict[str, dict] = {}
-    closure: set[str] = set()
+def collect_runtime_closure(node_modules_dir, dependency_specs):
+    package_cache = {}
+    closure = set()
     queue = list(dependency_specs.keys())
 
     while queue:
@@ -439,7 +467,7 @@ if missing:
     )
 PY
 
-if [ -f "\${BUNDLE_DIR}/.openclaw/openclaw.json" ]; then
+if [ -f "\${BUNDLE_DIR}/.openclaw/openclaw.json" ] && prompt_overwrite_file "\$HOME/.openclaw/openclaw.json" "~/.openclaw/openclaw.json"; then
   python3 - "\${BUNDLE_DIR}/.openclaw/openclaw.json" "\$HOME/.openclaw/openclaw.json" "\$HOME" "${SOURCE_OPENCLAW_HOME}" "${SOURCE_HOME_FOR_REWRITE}" <<'PY'
 import json
 import pathlib
@@ -490,7 +518,7 @@ target_path.write_text(
 )
 PY
 fi
-if [ -f "\${BUNDLE_DIR}/.openclaw/exec-approvals.json" ]; then
+if [ -f "\${BUNDLE_DIR}/.openclaw/exec-approvals.json" ] && prompt_overwrite_file "\$HOME/.openclaw/exec-approvals.json" "~/.openclaw/exec-approvals.json"; then
   cp "\${BUNDLE_DIR}/.openclaw/exec-approvals.json" "\$HOME/.openclaw/exec-approvals.json"
 fi
 if [ -f "\${BUNDLE_DIR}/.openclaw/control-plane-state.json" ]; then
@@ -500,7 +528,7 @@ if [ -f "\${BUNDLE_DIR}/.openclaw/workspace/SOUL.md" ]; then
   mkdir -p "\$HOME/.openclaw/workspace"
   cp "\${BUNDLE_DIR}/.openclaw/workspace/SOUL.md" "\$HOME/.openclaw/workspace/SOUL.md"
 fi
-if [ -f "\${BUNDLE_DIR}/.openclaw/.env" ]; then
+if [ -f "\${BUNDLE_DIR}/.openclaw/.env" ] && prompt_overwrite_file "\$HOME/.openclaw/.env" "~/.openclaw/.env"; then
   BUNDLE_ENV_CONTENT="\$(<"\${BUNDLE_DIR}/.openclaw/.env")"
   BUNDLE_ENV_CONTENT="\${BUNDLE_ENV_CONTENT//__OPENCLAW_HOME__/\$HOME/.openclaw}"
   EXISTING_ENV_PATH="\$HOME/.openclaw/.env"
@@ -519,7 +547,7 @@ preserve_keys = [
     "AGENT_BOT_BASE_URL",
 ]
 
-def parse_env(path: pathlib.Path):
+def parse_env(path):
     result = {}
     if not path.exists():
         return result

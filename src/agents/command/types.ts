@@ -32,6 +32,22 @@ export type AgentRunContext = {
   hasRepliedRef?: { value: boolean };
 };
 
+export type AgentPortalContext = {
+  mode?: string;
+  conversationView?: string;
+  runtimeRole?: string;
+  portalSessionId?: string;
+  traceId?: string;
+  writePolicy?: {
+    core?: string;
+    memory?: string;
+  };
+  userContext?: Record<string, unknown>;
+  releaseId?: string;
+  releaseVersion?: string;
+  releaseStatus?: string;
+};
+
 export type AgentCommandOpts = {
   message: string;
   /** Optional image attachments for multimodal messages. */
@@ -85,6 +101,7 @@ export type AgentCommandOpts = {
   lane?: string;
   runId?: string;
   extraSystemPrompt?: string;
+  portalContext?: AgentPortalContext;
   internalEvents?: AgentInternalEvent[];
   inputProvenance?: InputProvenance;
   /** Per-call stream param overrides (best-effort). */

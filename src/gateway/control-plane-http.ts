@@ -654,6 +654,25 @@ function buildPortalWritePolicy(conversationView: ControlPlaneConversationView):
   };
 }
 
+function buildPortalPluginContext(params: {
+  session: PortalSessionRecord;
+  portalSessionId?: string;
+  traceId?: string;
+}) {
+  return {
+    mode: params.session.mode,
+    conversationView: params.session.conversationView,
+    runtimeRole: params.session.runtimeRole,
+    portalSessionId: params.portalSessionId ?? params.session.portalSessionId,
+    traceId: params.traceId ?? params.session.traceId,
+    writePolicy: params.session.writePolicy,
+    userContext: params.session.userContext,
+    releaseId: params.session.releaseId,
+    releaseVersion: params.session.releaseVersion,
+    releaseStatus: params.session.releaseStatus,
+  };
+}
+
 function truncateText(value: string | undefined, maxChars: number): string | undefined {
   if (typeof value !== "string") {
     return undefined;
@@ -2363,6 +2382,11 @@ export async function handleControlPlaneHttpRequest(
                 portalSessionId,
                 skillSearchPrefetch,
               }),
+              portalContext: buildPortalPluginContext({
+                session: nextSession,
+                portalSessionId,
+                traceId,
+              }),
             },
             defaultRuntime,
             createDefaultDeps(),
@@ -2645,6 +2669,11 @@ export async function handleControlPlaneHttpRequest(
             traceId,
             portalSessionId,
             skillSearchPrefetch,
+          }),
+          portalContext: buildPortalPluginContext({
+            session: nextSession,
+            portalSessionId,
+            traceId,
           }),
         },
         defaultRuntime,

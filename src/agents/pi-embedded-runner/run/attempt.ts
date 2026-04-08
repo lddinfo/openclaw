@@ -1553,6 +1553,7 @@ export async function runEmbeddedAttempt(
           messageProvider: params.messageProvider ?? undefined,
           trigger: params.trigger,
           channelId: params.messageChannel ?? params.messageProvider ?? undefined,
+          portalContext: params.portalContext,
         };
         const hookResult = await resolvePromptBuildHookResult({
           prompt: params.prompt,
@@ -2083,6 +2084,7 @@ export async function runEmbeddedAttempt(
                 messageProvider: params.messageProvider ?? undefined,
                 trigger: params.trigger,
                 channelId: params.messageChannel ?? params.messageProvider ?? undefined,
+                portalContext: params.portalContext,
               },
             )
             .catch((err) => {

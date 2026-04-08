@@ -686,6 +686,16 @@ export const TOOL_DISPLAY_CONFIG: ToolDisplayConfig = {
       title: "Yield",
       detailKeys: ["message"],
     },
+    skill_registry_install: {
+      emoji: "🧩",
+      title: "Skill Registry Install",
+      detailKeys: [],
+    },
+    skill_registry_search: {
+      emoji: "🧩",
+      title: "Skill Registry Search",
+      detailKeys: [],
+    },
     tts: {
       emoji: "🔊",
       title: "TTS",

@@ -2315,6 +2315,22 @@ const promptInjectionHookNameSet = new Set<PluginHookName>(PROMPT_INJECTION_HOOK
 export const isPromptInjectionHookName = (hookName: PluginHookName): boolean =>
   promptInjectionHookNameSet.has(hookName);
 
+export type PluginHookPortalContext = {
+  mode?: string;
+  conversationView?: string;
+  runtimeRole?: string;
+  portalSessionId?: string;
+  traceId?: string;
+  writePolicy?: {
+    core?: string;
+    memory?: string;
+  };
+  userContext?: Record<string, unknown>;
+  releaseId?: string;
+  releaseVersion?: string;
+  releaseStatus?: string;
+};
+
 // Agent context shared across agent hooks
 export type PluginHookAgentContext = {
   /** Unique identifier for this agent run. */
@@ -2332,6 +2348,8 @@ export type PluginHookAgentContext = {
   trigger?: string;
   /** Channel identifier (e.g. "telegram", "discord", "whatsapp"). */
   channelId?: string;
+  /** Structured portal metadata for portal-backed sessions. */
+  portalContext?: PluginHookPortalContext;
 };
 
 // before_model_resolve hook

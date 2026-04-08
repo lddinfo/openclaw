@@ -19,6 +19,7 @@ import {
 } from "./bash-tools.js";
 import { listChannelAgentTools } from "./channel-tools.js";
 import { shouldSuppressManagedWebSearchTool } from "./codex-native-web-search.js";
+import type { AgentPortalContext } from "./command/types.js";
 import { resolveImageSanitizationLimits } from "./image-sanitization.js";
 import type { ModelAuthMode } from "./model-auth.js";
 import { createOpenClawTools } from "./openclaw-tools.js";
@@ -252,6 +253,7 @@ export function createOpenClawCodingTools(options?: {
   sessionId?: string;
   /** Stable run identifier for this agent invocation. */
   runId?: string;
+  portalContext?: AgentPortalContext;
   /** What initiated this run (for trigger-specific tool restrictions). */
   trigger?: string;
   /** Relative workspace path that memory-triggered writes may append to. */
@@ -672,6 +674,8 @@ export function createOpenClawCodingTools(options?: {
       sessionId: options?.sessionId,
       runId: options?.runId,
       loopDetection: resolveToolLoopDetectionConfig({ cfg: options?.config, agentId }),
+      workspaceDir: workspaceRoot,
+      portalContext: options?.portalContext,
     }),
   );
   const withAbort = options?.abortSignal

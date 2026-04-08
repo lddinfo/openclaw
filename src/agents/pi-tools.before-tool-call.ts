@@ -1,3 +1,4 @@
+import path from "node:path";
 import type { ToolLoopDetectionConfig } from "../config/types.tools.js";
 import type { SessionState } from "../logging/diagnostic-session-state.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
@@ -7,9 +8,19 @@ import { PluginApprovalResolutions, type PluginApprovalResolution } from "../plu
 import { createLazyRuntimeSurface } from "../shared/lazy-runtime.js";
 import { isPlainObject } from "../utils.js";
 import { copyChannelAgentToolMeta } from "./channel-tools.js";
+import { resolvePathFromInput } from "./path-policy.js";
 import { normalizeToolName } from "./tool-policy.js";
 import type { AnyAgentTool } from "./tools/common.js";
 import { callGatewayTool } from "./tools/gateway.js";
+
+type HookPortalContext = {
+  mode?: string;
+  conversationView?: string;
+  writePolicy?: {
+    core?: string;
+    memory?: string;
+  };
+};
 
 export type HookContext = {
   agentId?: string;
@@ -18,6 +29,8 @@ export type HookContext = {
   sessionId?: string;
   runId?: string;
   loopDetection?: ToolLoopDetectionConfig;
+  workspaceDir?: string;
+  portalContext?: HookPortalContext;
 };
 
 type HookOutcome = { blocked: true; reason: string } | { blocked: false; params: unknown };
@@ -30,6 +43,13 @@ const adjustedParamsByToolCallId = new Map<string, unknown>();
 const MAX_TRACKED_ADJUSTED_PARAMS = 1024;
 const LOOP_WARNING_BUCKET_SIZE = 10;
 const MAX_LOOP_WARNING_KEYS = 256;
+const PROTECTED_WORKSPACE_FILES = new Set([
+  "AGENTS.md",
+  "BOOTSTRAP.md",
+  "IDENTITY.md",
+  "SOUL.md",
+  "TOOLS.md",
+]);
 
 const loadBeforeToolCallRuntime = createLazyRuntimeSurface(
   () => import("./pi-tools.before-tool-call.runtime.js"),
@@ -54,6 +74,95 @@ function mergeParamsWithApprovalOverrides(
     return approvalParams;
   }
   return originalParams;
+}
+
+function normalizePortalMode(value: unknown): string {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function shouldBlockProtectedWorkspaceFiles(ctx?: HookContext): boolean {
+  if (!ctx?.portalContext) {
+    return false;
+  }
+  const mode = normalizePortalMode(ctx.portalContext.mode);
+  const conversationView = normalizePortalMode(ctx.portalContext.conversationView);
+  const coreWritePolicy = normalizePortalMode(ctx.portalContext.writePolicy?.core);
+  if (mode === "training" || conversationView === "training") {
+    return false;
+  }
+  if (coreWritePolicy === "candidate-core") {
+    return false;
+  }
+  return true;
+}
+
+function resolveProtectedWorkspaceFile(filePath: string, workspaceDir: string): string | null {
+  const trimmed = typeof filePath === "string" ? filePath.trim() : "";
+  if (!trimmed) {
+    return null;
+  }
+  let resolved: string;
+  try {
+    resolved = path.resolve(resolvePathFromInput(trimmed, workspaceDir));
+  } catch {
+    return null;
+  }
+  const basename = path.basename(resolved);
+  if (!PROTECTED_WORKSPACE_FILES.has(basename)) {
+    return null;
+  }
+  const protectedPath = path.join(workspaceDir, basename);
+  return resolved === protectedPath ? basename : null;
+}
+
+function collectProtectedWorkspaceFileHits(
+  toolName: string,
+  params: unknown,
+  workspaceDir?: string,
+): string[] {
+  if (!workspaceDir) {
+    return [];
+  }
+  const normalizedToolName = normalizeToolName(toolName || "tool");
+  const hits = new Set<string>();
+  const record = isPlainObject(params) ? params : {};
+  const maybeAddPath = (value: unknown) => {
+    if (typeof value !== "string") {
+      return;
+    }
+    const hit = resolveProtectedWorkspaceFile(value, workspaceDir);
+    if (hit) {
+      hits.add(hit);
+    }
+  };
+  if (normalizedToolName === "write" || normalizedToolName === "edit") {
+    maybeAddPath(record.path);
+    maybeAddPath(record.file_path);
+    maybeAddPath(record.filePath);
+  } else if (normalizedToolName === "apply_patch") {
+    const input = typeof record.input === "string" ? record.input : "";
+    const lines = input.split(/\r?\n/);
+    for (const line of lines) {
+      if (
+        line.startsWith("*** Add File: ") ||
+        line.startsWith("*** Delete File: ") ||
+        line.startsWith("*** Update File: ") ||
+        line.startsWith("*** Move to: ")
+      ) {
+        const candidate = line.replace(
+          /^\*\*\* (?:Add File|Delete File|Update File|Move to): /,
+          "",
+        );
+        maybeAddPath(candidate);
+      }
+    }
+  }
+  return [...hits];
+}
+
+function buildProtectedWorkspaceBlockReason(files: string[]): string {
+  const joined = files.join(", ");
+  return `Non-training portal sessions cannot modify protected agent files: ${joined}.`;
 }
 
 function isAbortSignalCancellation(err: unknown, signal?: AbortSignal): boolean {
@@ -135,6 +244,20 @@ export async function runBeforeToolCallHook(args: {
   const toolName = normalizeToolName(args.toolName || "tool");
   const params = args.params;
 
+  if (shouldBlockProtectedWorkspaceFiles(args.ctx)) {
+    const protectedHits = collectProtectedWorkspaceFileHits(
+      toolName,
+      params,
+      args.ctx?.workspaceDir,
+    );
+    if (protectedHits.length > 0) {
+      return {
+        blocked: true,
+        reason: buildProtectedWorkspaceBlockReason(protectedHits),
+      };
+    }
+  }
+
   if (args.ctx?.sessionKey) {
     const { getDiagnosticSessionState, logToolLoopAction, detectToolCallLoop, recordToolCall } =
       await loadBeforeToolCallRuntime();
@@ -198,6 +321,8 @@ export async function runBeforeToolCallHook(args: {
       ...(args.ctx?.sessionKey && { sessionKey: args.ctx.sessionKey }),
       ...(args.ctx?.sessionId && { sessionId: args.ctx.sessionId }),
       ...(args.ctx?.runId && { runId: args.ctx.runId }),
+      ...(args.ctx?.workspaceDir && { workspaceDir: args.ctx.workspaceDir }),
+      ...(args.ctx?.portalContext && { portalContext: args.ctx.portalContext }),
       ...(args.toolCallId && { toolCallId: args.toolCallId }),
     };
     const hookResult = await hookRunner.runBeforeToolCall(

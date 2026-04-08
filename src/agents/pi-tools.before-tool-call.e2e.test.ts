@@ -819,3 +819,126 @@ describe("before_tool_call requireApproval handling", () => {
     expect(onResolution).toHaveBeenCalledWith("cancelled");
   });
 });
+
+describe("before_tool_call protected workspace files", () => {
+  beforeEach(() => {
+    resetDiagnosticSessionStateForTest();
+    resetDiagnosticEventsForTest();
+    mockGetGlobalHookRunner.mockReturnValue({
+      hasHooks: vi.fn().mockReturnValue(false),
+      runBeforeToolCall: vi.fn(),
+    } as any);
+  });
+
+  const workspaceDir = "/tmp/openclaw-agent";
+  const servingCtx = {
+    agentId: "main",
+    sessionKey: "agent:main:portal:serving:rs_1",
+    workspaceDir,
+    portalContext: {
+      mode: "chat",
+      conversationView: "serving",
+      writePolicy: {
+        core: "forbidden",
+        memory: "user-memory",
+      },
+    },
+  } as const;
+
+  it("blocks write to protected root files for non-training portal sessions", async () => {
+    const result = await runBeforeToolCallHook({
+      toolName: "write",
+      params: { path: "AGENTS.md", content: "blocked" },
+      ctx: servingCtx,
+    });
+
+    expect(result).toEqual({
+      blocked: true,
+      reason: "Non-training portal sessions cannot modify protected agent files: AGENTS.md.",
+    });
+  });
+
+  it("blocks edit to protected root files for non-training portal sessions", async () => {
+    const result = await runBeforeToolCallHook({
+      toolName: "edit",
+      params: { path: "/tmp/openclaw-agent/BOOTSTRAP.md", oldText: "a", newText: "b" },
+      ctx: servingCtx,
+    });
+
+    expect(result).toEqual({
+      blocked: true,
+      reason: "Non-training portal sessions cannot modify protected agent files: BOOTSTRAP.md.",
+    });
+  });
+
+  it("blocks apply_patch touching protected root files for non-training portal sessions", async () => {
+    const result = await runBeforeToolCallHook({
+      toolName: "apply_patch",
+      params: {
+        input: [
+          "*** Begin Patch",
+          "*** Update File: IDENTITY.md",
+          "@@",
+          "-old",
+          "+new",
+          "*** End Patch",
+        ].join("\n"),
+      },
+      ctx: servingCtx,
+    });
+
+    expect(result).toEqual({
+      blocked: true,
+      reason: "Non-training portal sessions cannot modify protected agent files: IDENTITY.md.",
+    });
+  });
+
+  it("allows protected file edits during training sessions", async () => {
+    const result = await runBeforeToolCallHook({
+      toolName: "write",
+      params: { path: "SOUL.md", content: "allowed" },
+      ctx: {
+        ...servingCtx,
+        portalContext: {
+          mode: "training",
+          conversationView: "training",
+          writePolicy: {
+            core: "candidate-core",
+            memory: "candidate-core",
+          },
+        },
+      },
+    });
+
+    expect(result).toEqual({
+      blocked: false,
+      params: { path: "SOUL.md", content: "allowed" },
+    });
+  });
+
+  it("allows non-protected files for non-training portal sessions", async () => {
+    const result = await runBeforeToolCallHook({
+      toolName: "write",
+      params: { path: "notes.md", content: "ok" },
+      ctx: servingCtx,
+    });
+
+    expect(result).toEqual({
+      blocked: false,
+      params: { path: "notes.md", content: "ok" },
+    });
+  });
+
+  it("allows nested files with the same basename because only workspace root files are protected", async () => {
+    const result = await runBeforeToolCallHook({
+      toolName: "write",
+      params: { path: "docs/AGENTS.md", content: "ok" },
+      ctx: servingCtx,
+    });
+
+    expect(result).toEqual({
+      blocked: false,
+      params: { path: "docs/AGENTS.md", content: "ok" },
+    });
+  });
+});

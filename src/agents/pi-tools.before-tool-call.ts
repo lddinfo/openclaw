@@ -80,14 +80,29 @@ function normalizePortalMode(value: unknown): string {
   return typeof value === "string" ? value.trim().toLowerCase() : "";
 }
 
+function isTrainingPortalSessionKey(sessionKey: unknown): boolean {
+  return typeof sessionKey === "string" && sessionKey.includes(":portal:training:");
+}
+
+function isPortalSessionKey(sessionKey: unknown): boolean {
+  return typeof sessionKey === "string" && sessionKey.includes(":portal:");
+}
+
 function shouldBlockProtectedWorkspaceFiles(ctx?: HookContext): boolean {
   if (!ctx?.portalContext) {
-    return false;
+    if (!isPortalSessionKey(ctx?.sessionKey)) {
+      return false;
+    }
+    return !isTrainingPortalSessionKey(ctx?.sessionKey);
   }
   const mode = normalizePortalMode(ctx.portalContext.mode);
   const conversationView = normalizePortalMode(ctx.portalContext.conversationView);
   const coreWritePolicy = normalizePortalMode(ctx.portalContext.writePolicy?.core);
-  if (mode === "training" || conversationView === "training") {
+  if (
+    mode === "training" ||
+    conversationView === "training" ||
+    isTrainingPortalSessionKey(ctx?.sessionKey)
+  ) {
     return false;
   }
   if (coreWritePolicy === "candidate-core") {

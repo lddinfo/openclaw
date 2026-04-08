@@ -97,6 +97,37 @@ type PersistSessionEntryParams = {
   entry: SessionEntry;
 };
 
+function readPortalIdentityField(
+  userContext: Record<string, unknown> | undefined,
+  key: string,
+): string | undefined {
+  const value = userContext?.[key];
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function applyPortalIdentityToSessionEntry(
+  entry: SessionEntry,
+  userContext: Record<string, unknown> | undefined,
+): SessionEntry {
+  const portalUserId = readPortalIdentityField(userContext, "userId");
+  const portalUsername = readPortalIdentityField(userContext, "username");
+  if (!portalUserId && !portalUsername) {
+    return entry;
+  }
+  if (entry.portalUserId === portalUserId && entry.portalUsername === portalUsername) {
+    return entry;
+  }
+  return {
+    ...entry,
+    ...(portalUserId ? { portalUserId } : {}),
+    ...(portalUsername ? { portalUsername } : {}),
+  };
+}
+
 type OverrideFieldClearedByDelete =
   | "providerOverride"
   | "modelOverride"
@@ -548,12 +579,15 @@ async function agentCommandInternal(
         sessionId,
         updatedAt: Date.now(),
       };
-      const next: SessionEntry = {
-        ...current,
-        sessionId,
-        updatedAt: Date.now(),
-        skillsSnapshot,
-      };
+      const next = applyPortalIdentityToSessionEntry(
+        {
+          ...current,
+          sessionId,
+          updatedAt: Date.now(),
+          skillsSnapshot,
+        },
+        opts.portalContext?.userContext,
+      );
       await persistSessionEntry({
         sessionStore,
         sessionKey,
@@ -567,7 +601,10 @@ async function agentCommandInternal(
     if (sessionStore && sessionKey) {
       const entry = sessionStore[sessionKey] ??
         sessionEntry ?? { sessionId, updatedAt: Date.now() };
-      const next: SessionEntry = { ...entry, sessionId, updatedAt: Date.now() };
+      const next = applyPortalIdentityToSessionEntry(
+        { ...entry, sessionId, updatedAt: Date.now() },
+        opts.portalContext?.userContext,
+      );
       if (thinkOverride) {
         next.thinkingLevel = thinkOverride;
       }

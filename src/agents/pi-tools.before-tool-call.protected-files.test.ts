@@ -52,6 +52,23 @@ describe("before_tool_call protected workspace files", () => {
     });
   });
 
+  it("blocks protected files for serving portal session keys even without portalContext", async () => {
+    const result = await runBeforeToolCallHook({
+      toolName: "edit",
+      params: { path: "AGENTS.md", oldText: "a", newText: "b" },
+      ctx: {
+        agentId: "main",
+        sessionKey: "agent:main:portal:serving:rs_2",
+        workspaceDir,
+      },
+    });
+
+    expect(result).toEqual({
+      blocked: true,
+      reason: "Non-training portal sessions cannot modify protected agent files: AGENTS.md.",
+    });
+  });
+
   it("blocks apply_patch touching protected root files for non-training portal sessions", async () => {
     const result = await runBeforeToolCallHook({
       toolName: "apply_patch",

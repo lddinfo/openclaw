@@ -225,6 +225,10 @@ export type SessionEntry = {
   space?: string;
   origin?: SessionOrigin;
   deliveryContext?: DeliveryContext;
+  /** Persisted portal identity for portal-backed sessions so downstream runtime/plugin code can recover user binding reliably. */
+  portalUserId?: string;
+  /** Persisted portal username for portal-backed sessions so downstream runtime/plugin code can recover user binding reliably. */
+  portalUsername?: string;
   lastChannel?: SessionChannelId;
   lastTo?: string;
   lastAccountId?: string;

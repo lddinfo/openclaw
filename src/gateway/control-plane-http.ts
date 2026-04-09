@@ -22,10 +22,16 @@ import { agentCommandFromIngress } from "../commands/agent.js";
 import { loadConfig, writeConfigFile } from "../config/config.js";
 import { onAgentEvent, type AgentEventPayload } from "../infra/agent-events.js";
 import type { ExecApprovalDecision } from "../infra/exec-approvals.js";
+import type { PromptImageOrderEntry } from "../media/prompt-image-order.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import { defaultRuntime } from "../runtime.js";
 import { safeJsonStringify } from "../utils/safe-json.js";
 import { resolveAssistantStreamDeltaText } from "./agent-event-assistant-text.js";
+import {
+  parseMessageWithAttachments,
+  type ChatAttachment,
+  type ChatImageContent,
+} from "./chat-attachments.js";
 import {
   loadControlPlaneRuntimeState,
   mergeControlPlaneRuntimeState,
@@ -2238,6 +2244,7 @@ export async function handleControlPlaneHttpRequest(
       sendJson(res, 400, { error: "missing or invalid message" });
       return true;
     }
+    const attachments: ChatAttachment[] = Array.isArray(body.attachments) ? body.attachments : [];
     const traceId = readOptionalString(body, "traceId");
     const portalSessionId = readOptionalString(body, "portalSessionId");
     const runId = `run_${randomUUID().replace(/-/g, "")}`;
@@ -2284,6 +2291,21 @@ export async function handleControlPlaneHttpRequest(
       startedAt: runStartedAt,
       timeline: [{ phase: "started", at: runStartedAt }],
     });
+
+    let effectiveMessage = message;
+    let parsedImages: ChatImageContent[] = [];
+    let parsedImageOrder: PromptImageOrderEntry[] = [];
+
+    if (attachments.length > 0) {
+      const parsed = await parseMessageWithAttachments(message, attachments, {
+        maxBytes: 5_000_000,
+        supportsImages: true,
+      });
+      effectiveMessage = parsed.message;
+      parsedImages = parsed.images;
+      parsedImageOrder = parsed.imageOrder;
+    }
+
     if (isSseRequest(req)) {
       setSseHeaders(res);
       let streamClosed = false;
@@ -2366,7 +2388,9 @@ export async function handleControlPlaneHttpRequest(
           const cfg = loadConfig();
           const result = await agentCommandFromIngress(
             {
-              message,
+              message: effectiveMessage,
+              images: parsedImages.length > 0 ? parsedImages : undefined,
+              imageOrder: parsedImageOrder.length > 0 ? parsedImageOrder : undefined,
               sessionKey: nextSession.sessionKey,
               runId,
               deliver: false,
@@ -2654,7 +2678,9 @@ export async function handleControlPlaneHttpRequest(
       const cfg = loadConfig();
       const result = await agentCommandFromIngress(
         {
-          message,
+          message: effectiveMessage,
+          images: parsedImages.length > 0 ? parsedImages : undefined,
+          imageOrder: parsedImageOrder.length > 0 ? parsedImageOrder : undefined,
           sessionKey: nextSession.sessionKey,
           runId,
           deliver: false,

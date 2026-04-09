@@ -590,6 +590,25 @@ function readOptionalString(body: JsonObject, ...keys: string[]): string | undef
   return undefined;
 }
 
+function readOptionalBoolean(body: JsonObject, ...keys: string[]): boolean | undefined {
+  for (const key of keys) {
+    const value = body[key];
+    if (typeof value === "boolean") {
+      return value;
+    }
+    if (typeof value === "string") {
+      const normalized = value.trim().toLowerCase();
+      if (normalized === "true") {
+        return true;
+      }
+      if (normalized === "false") {
+        return false;
+      }
+    }
+  }
+  return undefined;
+}
+
 function readOptionalObject(body: JsonObject, ...keys: string[]): JsonObject | undefined {
   for (const key of keys) {
     const value = body[key];
@@ -598,6 +617,22 @@ function readOptionalObject(body: JsonObject, ...keys: string[]): JsonObject | u
     }
   }
   return undefined;
+}
+
+async function copyWorkspaceTreeIfExists(params: {
+  cfg: ReturnType<typeof loadConfig>;
+  sourceAgentId: string;
+  targetWorkspaceDir: string;
+}): Promise<boolean> {
+  const sourceWorkspaceDir = resolveAgentWorkspaceDir(params.cfg, params.sourceAgentId);
+  try {
+    await fs.access(sourceWorkspaceDir);
+  } catch {
+    return false;
+  }
+  await fs.rm(params.targetWorkspaceDir, { recursive: true, force: true });
+  await fs.cp(sourceWorkspaceDir, params.targetWorkspaceDir, { recursive: true, force: true });
+  return true;
 }
 
 function normalizePortalMode(value: unknown): PortalSessionMode {
@@ -1351,6 +1386,13 @@ async function ensureLocalAgentProvisioned(body: JsonObject): Promise<{
   const currentCfg = loadConfig();
   const workspaceDir = resolveAgentWorkspaceDir(currentCfg, requestedAgentId);
   const agentDir = resolveAgentDir(currentCfg, requestedAgentId);
+  const preserveWorkspace =
+    readOptionalBoolean(body, "preserveWorkspace", "preserveExistingWorkspace") === true;
+  const createFreshWorkspace =
+    readOptionalBoolean(body, "createFreshWorkspace", "freshWorkspace") === true;
+  const cloneFromLocalAgentKey = normalizeAgentId(
+    readOptionalString(body, "cloneFromLocalAgentKey", "cloneFromAgentId") || "",
+  );
   const existingEntries = [...listAgentEntries(currentCfg)];
   const existingIndex = existingEntries.findIndex(
     (entry) => normalizeAgentId(entry.id) === requestedAgentId,
@@ -1393,32 +1435,55 @@ async function ensureLocalAgentProvisioned(body: JsonObject): Promise<{
     );
   }
 
+  if (createFreshWorkspace) {
+    if (cloneFromLocalAgentKey && cloneFromLocalAgentKey !== requestedAgentId) {
+      const cloned = await copyWorkspaceTreeIfExists({
+        cfg,
+        sourceAgentId: cloneFromLocalAgentKey,
+        targetWorkspaceDir: resolveAgentWorkspaceDir(cfg, requestedAgentId),
+      });
+      if (!cloned) {
+        await fs.rm(resolveAgentWorkspaceDir(cfg, requestedAgentId), {
+          recursive: true,
+          force: true,
+        });
+      }
+    } else {
+      await fs.rm(resolveAgentWorkspaceDir(cfg, requestedAgentId), {
+        recursive: true,
+        force: true,
+      });
+    }
+  }
+
   const workspace = await ensureAgentWorkspace({
     dir: resolveAgentWorkspaceDir(cfg, requestedAgentId),
     ensureBootstrapFiles: true,
   });
-  const explicitWorkspaceFiles = parseWorkspaceFilesFromValue(body.workspaceFiles);
-  const existingWorkspaceMetadata =
-    explicitWorkspaceFiles.length > 0 ? {} : await loadExistingWorkspaceMetadata(workspace.dir);
-  const workspaceFiles =
-    explicitWorkspaceFiles.length > 0
-      ? explicitWorkspaceFiles
-      : buildDefaultWorkspaceFiles({
-          agentId: requestedAgentId,
-          name:
-            readOptionalString(body, "name") ??
-            existingEntry?.name ??
-            existingWorkspaceMetadata.name,
-          description:
-            readOptionalString(body, "description") ?? existingWorkspaceMetadata.description,
-          systemPrompt:
-            readOptionalString(body, "systemPrompt") ?? existingWorkspaceMetadata.systemPrompt,
-          skillSnapshotId:
-            readOptionalString(body, "skillSnapshotId", "snapshotId") ??
-            existingWorkspaceMetadata.skillSnapshotId,
-        });
-  for (const file of workspaceFiles) {
-    await writeTextFile(path.join(workspace.dir, file.name), file.content);
+  if (!preserveWorkspace) {
+    const explicitWorkspaceFiles = parseWorkspaceFilesFromValue(body.workspaceFiles);
+    const existingWorkspaceMetadata =
+      explicitWorkspaceFiles.length > 0 ? {} : await loadExistingWorkspaceMetadata(workspace.dir);
+    const workspaceFiles =
+      explicitWorkspaceFiles.length > 0
+        ? explicitWorkspaceFiles
+        : buildDefaultWorkspaceFiles({
+            agentId: requestedAgentId,
+            name:
+              readOptionalString(body, "name") ??
+              existingEntry?.name ??
+              existingWorkspaceMetadata.name,
+            description:
+              readOptionalString(body, "description") ?? existingWorkspaceMetadata.description,
+            systemPrompt:
+              readOptionalString(body, "systemPrompt") ?? existingWorkspaceMetadata.systemPrompt,
+            skillSnapshotId:
+              readOptionalString(body, "skillSnapshotId", "snapshotId") ??
+              existingWorkspaceMetadata.skillSnapshotId,
+          });
+    for (const file of workspaceFiles) {
+      await writeTextFile(path.join(workspace.dir, file.name), file.content);
+    }
   }
 
   return {

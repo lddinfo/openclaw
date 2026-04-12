@@ -117,9 +117,7 @@ function buildPortalRuntimeEvent(params: {
 }
 
 function isSseRequest(req: IncomingMessage): boolean {
-  return String(req.headers.accept ?? "")
-    .toLowerCase()
-    .includes("text/event-stream");
+  return (req.headers.accept ?? "").toLowerCase().includes("text/event-stream");
 }
 
 function writePortalStreamEvent(res: ServerResponse, type: string, data: unknown): void {
@@ -461,7 +459,7 @@ type PortalRunRecord = {
   remoteSessionId: string;
   portalSessionId?: string;
   traceId?: string;
-  status: "started" | "requires_approval" | "completed" | "failed" | "approval_applied";
+  status: "started" | "requires_approval" | "completed" | "failed" | "approval_applied" | "stopped";
   startedAt: string;
   endedAt?: string;
   durationMs?: number;
@@ -500,6 +498,7 @@ const PLATFORM_DEFAULT_FIND_SKILL_NAME = "find-base-skills";
 
 const portalSessions = new Map<string, PortalSessionRecord>();
 const portalRuns = new Map<string, PortalRunRecord>();
+const portalRunAbortControllers = new Map<string, AbortController>();
 
 function isJsonObject(value: unknown): value is JsonObject {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -2288,6 +2287,80 @@ export async function handleControlPlaneHttpRequest(
     return true;
   }
 
+  const portalMessageAbortMatch = url.pathname.match(
+    new RegExp(
+      `^${PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/portal/sessions/([^/]+)/messages/abort$`,
+    ),
+  );
+  if (portalMessageAbortMatch) {
+    if (!ensureMethod(req, res, "POST")) {
+      return true;
+    }
+    const remoteSessionId = portalMessageAbortMatch[1] ?? "";
+    const session = portalSessions.get(remoteSessionId);
+    if (!session) {
+      sendJson(res, 404, { ok: false, error: "session not found", remoteSessionId });
+      return true;
+    }
+    const body = await readBody(req);
+    const runId = readOptionalString(body, "runId") ?? session.lastRunId ?? null;
+    if (!runId) {
+      sendJson(res, 200, {
+        ok: true,
+        aborted: false,
+        runId: null,
+        remoteSessionId,
+        portalSessionId: session.portalSessionId ?? null,
+      });
+      return true;
+    }
+    const abortController = portalRunAbortControllers.get(runId);
+    if (!abortController) {
+      sendJson(res, 200, {
+        ok: true,
+        aborted: false,
+        runId,
+        remoteSessionId,
+        portalSessionId: session.portalSessionId ?? null,
+      });
+      return true;
+    }
+    abortController.abort();
+    portalRunAbortControllers.delete(runId);
+    const stoppedAt = new Date().toISOString();
+    const existingRun = portalRuns.get(runId);
+    if (existingRun && !existingRun.endedAt) {
+      savePortalRun({
+        ...existingRun,
+        status: "stopped",
+        endedAt: stoppedAt,
+        durationMs: Math.max(0, Date.parse(stoppedAt) - Date.parse(existingRun.startedAt)),
+        error: {
+          message: "Portal run aborted by user",
+          code: "PORTAL_RUN_ABORTED",
+        },
+        timeline: appendPortalRunTimeline(existingRun, {
+          phase: "stopped",
+          at: stoppedAt,
+          error: "Portal run aborted by user",
+        }),
+      });
+    }
+    portalSessions.set(remoteSessionId, {
+      ...session,
+      updatedAt: stoppedAt,
+    });
+    sendJson(res, 200, {
+      ok: true,
+      aborted: true,
+      runId,
+      remoteSessionId,
+      portalSessionId: session.portalSessionId ?? null,
+      stoppedAt,
+    });
+    return true;
+  }
+
   const portalMessagesMatch = url.pathname.match(
     new RegExp(
       `^${PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/portal/sessions/([^/]+)/messages$`,
@@ -2373,6 +2446,8 @@ export async function handleControlPlaneHttpRequest(
 
     if (isSseRequest(req)) {
       setSseHeaders(res);
+      const runAbortController = new AbortController();
+      portalRunAbortControllers.set(runId, runAbortController);
       let streamClosed = false;
       let sawAssistantDelta = false;
       let streamedApproval: PortalApprovalSummary | undefined;
@@ -2476,6 +2551,7 @@ export async function handleControlPlaneHttpRequest(
                 portalSessionId,
                 traceId,
               }),
+              abortSignal: runAbortController.signal,
             },
             defaultRuntime,
             createDefaultDeps(),
@@ -2684,41 +2760,46 @@ export async function handleControlPlaneHttpRequest(
         } catch (error) {
           const failedAt = new Date().toISOString();
           const message = error instanceof Error ? error.message : String(error);
+          const aborted = runAbortController.signal.aborted;
+          const failureCode = aborted ? "PORTAL_RUN_ABORTED" : "PORTAL_RUN_FAILED";
+          const failureStatus = aborted ? "stopped" : "failed";
+          const failureMessage = aborted ? "已暂停当前执行" : message;
           const runRecord = savePortalRun({
             runId,
             remoteSessionId,
             portalSessionId: portalSessionId ?? nextSession.portalSessionId,
             traceId: traceId ?? nextSession.traceId,
-            status: "failed",
+            status: failureStatus,
             startedAt: runStartedAt,
             endedAt: failedAt,
             durationMs: Math.max(0, Date.parse(failedAt) - Date.parse(runStartedAt)),
             error: {
-              message,
+              message: failureMessage,
+              code: failureCode,
             },
             timeline: appendPortalRunTimeline(portalRuns.get(runId), {
-              phase: "failed",
+              phase: aborted ? "stopped" : "failed",
               at: failedAt,
-              error: message,
+              error: failureMessage,
             }),
           });
           const runFailedEvent = buildPortalRuntimeEvent({
-            eventType: "run.failed",
-            level: "error",
-            message: `Portal run ${runId} failed`,
+            eventType: aborted ? "run.stopped" : "run.failed",
+            level: aborted ? "warn" : "error",
+            message: aborted ? `Portal run ${runId} stopped` : `Portal run ${runId} failed`,
             payload: {
               runId,
-              code: "PORTAL_RUN_FAILED",
-              error: message,
+              code: failureCode,
+              error: failureMessage,
             },
             createdAt: failedAt,
           });
           if (!streamClosed) {
             writePortalStreamEvent(res, "runtime.event", runFailedEvent);
             writePortalStreamEvent(res, "message.error", {
-              code: "PORTAL_RUN_FAILED",
-              message,
-              status: 500,
+              code: failureCode,
+              message: failureMessage,
+              status: aborted ? 409 : 500,
               runId,
               traceId: traceId ?? nextSession.traceId,
               portalSessionId: portalSessionId ?? nextSession.portalSessionId,
@@ -2732,6 +2813,7 @@ export async function handleControlPlaneHttpRequest(
             });
           }
         } finally {
+          portalRunAbortControllers.delete(runId);
           if (!streamClosed) {
             closeStream();
           }
@@ -2739,6 +2821,8 @@ export async function handleControlPlaneHttpRequest(
       })();
       return true;
     }
+    const runAbortController = new AbortController();
+    portalRunAbortControllers.set(runId, runAbortController);
     try {
       const cfg = loadConfig();
       const result = await agentCommandFromIngress(
@@ -2766,6 +2850,7 @@ export async function handleControlPlaneHttpRequest(
             portalSessionId,
             traceId,
           }),
+          abortSignal: runAbortController.signal,
         },
         defaultRuntime,
         createDefaultDeps(),
@@ -2964,40 +3049,45 @@ export async function handleControlPlaneHttpRequest(
     } catch (error) {
       const failedAt = new Date().toISOString();
       const message = error instanceof Error ? error.message : String(error);
+      const aborted = runAbortController.signal.aborted;
+      const failureCode = aborted ? "PORTAL_RUN_ABORTED" : "PORTAL_RUN_FAILED";
+      const failureStatus = aborted ? "stopped" : "failed";
+      const failureMessage = aborted ? "已暂停当前执行" : message;
       const runRecord = savePortalRun({
         runId,
         remoteSessionId,
         portalSessionId: portalSessionId ?? nextSession.portalSessionId,
         traceId: traceId ?? nextSession.traceId,
-        status: "failed",
+        status: failureStatus,
         startedAt: runStartedAt,
         endedAt: failedAt,
         durationMs: Math.max(0, Date.parse(failedAt) - Date.parse(runStartedAt)),
         error: {
-          message,
+          message: failureMessage,
+          code: failureCode,
         },
         timeline: appendPortalRunTimeline(portalRuns.get(runId), {
-          phase: "failed",
+          phase: aborted ? "stopped" : "failed",
           at: failedAt,
-          error: message,
+          error: failureMessage,
         }),
       });
       const runFailedEvent = buildPortalRuntimeEvent({
-        eventType: "run.failed",
-        level: "error",
-        message: `Portal run ${runId} failed`,
+        eventType: aborted ? "run.stopped" : "run.failed",
+        level: aborted ? "warn" : "error",
+        message: aborted ? `Portal run ${runId} stopped` : `Portal run ${runId} failed`,
         payload: {
           runId,
-          code: "PORTAL_RUN_FAILED",
-          error: message,
+          code: failureCode,
+          error: failureMessage,
         },
         createdAt: failedAt,
       });
-      sendJson(res, 500, {
+      sendJson(res, aborted ? 409 : 500, {
         ok: false,
-        error: message,
-        code: "PORTAL_RUN_FAILED",
-        status: "failed",
+        error: failureMessage,
+        code: failureCode,
+        status: failureStatus,
         runId,
         traceId: traceId ?? nextSession.traceId,
         portalSessionId: portalSessionId ?? nextSession.portalSessionId,
@@ -3009,6 +3099,8 @@ export async function handleControlPlaneHttpRequest(
         usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
         runtimeEvents: [runStartedEvent, runFailedEvent],
       });
+    } finally {
+      portalRunAbortControllers.delete(runId);
     }
     return true;
   }

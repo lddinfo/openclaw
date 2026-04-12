@@ -14,6 +14,7 @@ import {
   type MemorySyncProgressUpdate,
   type ResolvedQmdConfig,
 } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
+import type { AgentPortalContext } from "../../../../src/agents/command/types.js";
 
 const MEMORY_SEARCH_MANAGER_CACHE_KEY = Symbol.for("openclaw.memorySearchManagerCache");
 type MemorySearchManagerCacheStore = {
@@ -48,6 +49,7 @@ export async function getMemorySearchManager(params: {
   cfg: OpenClawConfig;
   agentId: string;
   purpose?: "default" | "status";
+  portalContext?: AgentPortalContext;
 }): Promise<MemorySearchManagerResult> {
   const resolved = resolveMemoryBackendConfig(params);
   if (resolved.backend === "qmd" && resolved.qmd) {

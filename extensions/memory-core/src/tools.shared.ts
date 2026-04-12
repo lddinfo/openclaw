@@ -9,6 +9,7 @@ import {
   type OpenClawConfig,
 } from "openclaw/plugin-sdk/memory-core-host-runtime-core";
 import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/text-runtime";
+import type { AgentPortalContext } from "../../../src/agents/command/types.js";
 
 type MemoryToolRuntime = typeof import("./tools.runtime.js");
 type MemorySearchManagerResult = Awaited<
@@ -43,6 +44,7 @@ export const MemoryGetSchema = Type.Object({
 export function resolveMemoryToolContext(options: {
   config?: OpenClawConfig;
   agentSessionKey?: string;
+  portalContext?: AgentPortalContext;
 }) {
   const cfg = options.config;
   if (!cfg) {
@@ -61,6 +63,7 @@ export function resolveMemoryToolContext(options: {
 export async function getMemoryManagerContext(params: {
   cfg: OpenClawConfig;
   agentId: string;
+  portalContext?: AgentPortalContext;
 }): Promise<
   | {
       manager: NonNullable<MemorySearchManagerResult["manager"]>;
@@ -76,6 +79,7 @@ export async function getMemoryManagerContextWithPurpose(params: {
   cfg: OpenClawConfig;
   agentId: string;
   purpose?: "default" | "status";
+  portalContext?: AgentPortalContext;
 }): Promise<
   | {
       manager: NonNullable<MemorySearchManagerResult["manager"]>;
@@ -89,6 +93,7 @@ export async function getMemoryManagerContextWithPurpose(params: {
     cfg: params.cfg,
     agentId: params.agentId,
     purpose: params.purpose,
+    portalContext: params.portalContext,
   });
   return manager ? { manager } : { error };
 }
@@ -97,6 +102,7 @@ export function createMemoryTool(params: {
   options: {
     config?: OpenClawConfig;
     agentSessionKey?: string;
+    portalContext?: AgentPortalContext;
   };
   label: string;
   name: string;
@@ -141,6 +147,7 @@ export async function searchMemoryCorpusSupplements(params: {
   maxResults?: number;
   agentSessionKey?: string;
   corpus?: "memory" | "wiki" | "all";
+  portalContext?: AgentPortalContext;
 }): Promise<MemoryCorpusSearchResult[]> {
   if (params.corpus === "memory") {
     return [];
@@ -170,6 +177,7 @@ export async function getMemoryCorpusSupplementResult(params: {
   lineCount?: number;
   agentSessionKey?: string;
   corpus?: "memory" | "wiki" | "all";
+  portalContext?: AgentPortalContext;
 }): Promise<MemoryCorpusGetResult | null> {
   if (params.corpus === "memory") {
     return null;

@@ -14,6 +14,7 @@ import {
   resolveMemoryCorePluginConfig,
   resolveMemoryDeepDreamingConfig,
 } from "openclaw/plugin-sdk/memory-core-host-status";
+import type { AgentPortalContext } from "../../../src/agents/command/types.js";
 import { recordShortTermRecalls } from "./short-term-promotion.js";
 import {
   clampResultsByInjectedChars,
@@ -74,7 +75,9 @@ function queueShortTermRecallTracking(params: {
   });
 }
 
-function normalizeActiveMemoryQmdSearchMode(value: unknown): "inherit" | "search" | "vsearch" | "query" {
+function normalizeActiveMemoryQmdSearchMode(
+  value: unknown,
+): "inherit" | "search" | "vsearch" | "query" {
   return value === "inherit" || value === "search" || value === "vsearch" || value === "query"
     ? value
     : "search";
@@ -97,7 +100,9 @@ function resolveActiveMemoryQmdSearchModeOverride(
       ? (entry as { config?: unknown })
       : undefined;
   const pluginConfig =
-    entryRecord?.config && typeof entryRecord.config === "object" && !Array.isArray(entryRecord.config)
+    entryRecord?.config &&
+    typeof entryRecord.config === "object" &&
+    !Array.isArray(entryRecord.config)
       ? (entryRecord.config as { qmd?: { searchMode?: unknown } })
       : undefined;
   const searchMode = normalizeActiveMemoryQmdSearchMode(pluginConfig?.qmd?.searchMode);
@@ -110,6 +115,7 @@ async function getSupplementMemoryReadResult(params: {
   lines?: number;
   agentSessionKey?: string;
   corpus?: "memory" | "wiki" | "all";
+  portalContext?: AgentPortalContext;
 }) {
   const supplement = await getMemoryCorpusSupplementResult({
     lookup: params.relPath,
@@ -117,6 +123,7 @@ async function getSupplementMemoryReadResult(params: {
     lineCount: params.lines,
     agentSessionKey: params.agentSessionKey,
     corpus: params.corpus,
+    portalContext: params.portalContext,
   });
   if (!supplement) {
     return null;
@@ -135,6 +142,7 @@ async function resolveMemoryReadFailureResult(params: {
   from?: number;
   lines?: number;
   agentSessionKey?: string;
+  portalContext?: AgentPortalContext;
 }) {
   if (params.requestedCorpus === "all") {
     const supplement = await getSupplementMemoryReadResult({
@@ -143,6 +151,7 @@ async function resolveMemoryReadFailureResult(params: {
       lines: params.lines,
       agentSessionKey: params.agentSessionKey,
       corpus: params.requestedCorpus,
+      portalContext: params.portalContext,
     });
     if (supplement) {
       return jsonResult(supplement);
@@ -159,6 +168,7 @@ async function executeMemoryReadResult<T>(params: {
   from?: number;
   lines?: number;
   agentSessionKey?: string;
+  portalContext?: AgentPortalContext;
 }) {
   try {
     return jsonResult(await params.read());
@@ -170,6 +180,7 @@ async function executeMemoryReadResult<T>(params: {
       from: params.from,
       lines: params.lines,
       agentSessionKey: params.agentSessionKey,
+      portalContext: params.portalContext,
     });
   }
 }
@@ -177,6 +188,7 @@ async function executeMemoryReadResult<T>(params: {
 export function createMemorySearchTool(options: {
   config?: OpenClawConfig;
   agentSessionKey?: string;
+  portalContext?: AgentPortalContext;
 }): AnyAgentTool | null {
   return createMemoryTool({
     options,
@@ -199,7 +211,13 @@ export function createMemorySearchTool(options: {
         const { resolveMemoryBackendConfig } = await loadMemoryToolRuntime();
         const shouldQueryMemory = requestedCorpus !== "wiki";
         const shouldQuerySupplements = requestedCorpus === "wiki" || requestedCorpus === "all";
-        const memory = shouldQueryMemory ? await getMemoryManagerContext({ cfg, agentId }) : null;
+        const memory = shouldQueryMemory
+          ? await getMemoryManagerContext({
+              cfg,
+              agentId,
+              portalContext: options.portalContext,
+            })
+          : null;
         if (shouldQueryMemory && memory && "error" in memory && !shouldQuerySupplements) {
           return jsonResult(buildMemorySearchUnavailableResult(memory.error));
         }
@@ -243,7 +261,11 @@ export function createMemorySearchTool(options: {
             });
             const status = memory.manager.status();
             const decorated = decorateCitations(rawResults, includeCitations);
-            const resolved = resolveMemoryBackendConfig({ cfg, agentId });
+            const resolved = resolveMemoryBackendConfig({
+              cfg,
+              agentId,
+              portalContext: options.portalContext,
+            });
             const memoryResults =
               status.backend === "qmd"
                 ? clampResultsByInjectedChars(decorated, resolved.qmd?.limits.maxInjectedChars)
@@ -271,7 +293,10 @@ export function createMemorySearchTool(options: {
             searchDebug = {
               backend: status.backend,
               configuredMode: latestDebug?.configuredMode,
-              effectiveMode: status.backend === "qmd" ? (latestDebug?.effectiveMode ?? latestDebug?.configuredMode) : "n/a",
+              effectiveMode:
+                status.backend === "qmd"
+                  ? (latestDebug?.effectiveMode ?? latestDebug?.configuredMode)
+                  : "n/a",
               fallback: latestDebug?.fallback,
               searchMs: Math.max(0, Date.now() - searchStartedAt),
               hits: rawResults.length,
@@ -283,6 +308,7 @@ export function createMemorySearchTool(options: {
                 maxResults,
                 agentSessionKey: options.agentSessionKey,
                 corpus: requestedCorpus,
+                portalContext: options.portalContext,
               })
             : [];
           const results = [...surfacedMemoryResults, ...supplementResults]
@@ -313,6 +339,7 @@ export function createMemorySearchTool(options: {
 export function createMemoryGetTool(options: {
   config?: OpenClawConfig;
   agentSessionKey?: string;
+  portalContext?: AgentPortalContext;
 }): AnyAgentTool | null {
   return createMemoryTool({
     options,
@@ -340,6 +367,7 @@ export function createMemoryGetTool(options: {
             lines: lines ?? undefined,
             agentSessionKey: options.agentSessionKey,
             corpus: requestedCorpus,
+            portalContext: options.portalContext,
           });
           return jsonResult(
             supplement ?? {
@@ -350,7 +378,11 @@ export function createMemoryGetTool(options: {
             },
           );
         }
-        const resolved = resolveMemoryBackendConfig({ cfg, agentId });
+        const resolved = resolveMemoryBackendConfig({
+          cfg,
+          agentId,
+          portalContext: options.portalContext,
+        });
         if (resolved.backend === "builtin") {
           return await executeMemoryReadResult({
             read: async () =>
@@ -366,12 +398,14 @@ export function createMemoryGetTool(options: {
             from: from ?? undefined,
             lines: lines ?? undefined,
             agentSessionKey: options.agentSessionKey,
+            portalContext: options.portalContext,
           });
         }
         const memory = await getMemoryManagerContextWithPurpose({
           cfg,
           agentId,
           purpose: "status",
+          portalContext: options.portalContext,
         });
         if ("error" in memory) {
           return jsonResult({ path: relPath, text: "", disabled: true, error: memory.error });
@@ -388,6 +422,7 @@ export function createMemoryGetTool(options: {
           from: from ?? undefined,
           lines: lines ?? undefined,
           agentSessionKey: options.agentSessionKey,
+          portalContext: options.portalContext,
         });
       },
   });

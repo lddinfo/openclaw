@@ -1,3 +1,8 @@
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalLowercaseString,
+  normalizeOptionalString,
+} from "openclaw/plugin-sdk/text-runtime";
 import { fetchWithSsrFGuard, type SsrFPolicy } from "../../runtime-api.js";
 import { getMSTeamsRuntime } from "../runtime.js";
 import { ensureUserAgentHeader } from "../user-agent.js";
@@ -5,10 +10,13 @@ import { downloadMSTeamsAttachments } from "./download.js";
 import { downloadAndStoreMSTeamsRemoteMedia } from "./remote-media.js";
 import {
   applyAuthorizationHeaderForUrl,
+  encodeGraphShareId,
   GRAPH_ROOT,
+  estimateBase64DecodedBytes,
   inferPlaceholder,
-  isRecord,
+  readNestedString,
   isUrlAllowed,
+  type MSTeamsAttachmentDownloadLogger,
   type MSTeamsAttachmentFetchPolicy,
   normalizeContentType,
   resolveMediaSsrfPolicy,
@@ -38,17 +46,6 @@ type GraphAttachment = {
   content?: unknown;
 };
 
-function readNestedString(value: unknown, keys: Array<string | number>): string | undefined {
-  let current: unknown = value;
-  for (const key of keys) {
-    if (!isRecord(current)) {
-      return undefined;
-    }
-    current = current[key as keyof typeof current];
-  }
-  return typeof current === "string" && current.trim() ? current.trim() : undefined;
-}
-
 export function buildMSTeamsGraphMessageUrls(params: {
   conversationType?: string | null;
   conversationId?: string | null;
@@ -57,10 +54,10 @@ export function buildMSTeamsGraphMessageUrls(params: {
   conversationMessageId?: string | null;
   channelData?: unknown;
 }): string[] {
-  const conversationType = params.conversationType?.trim().toLowerCase() ?? "";
+  const conversationType = normalizeLowercaseStringOrEmpty(params.conversationType ?? "");
   const messageIdCandidates = new Set<string>();
   const pushCandidate = (value: string | null | undefined) => {
-    const trimmed = typeof value === "string" ? value.trim() : "";
+    const trimmed = normalizeOptionalString(value) ?? "";
     if (trimmed) {
       messageIdCandidates.add(trimmed);
     }
@@ -71,7 +68,7 @@ export function buildMSTeamsGraphMessageUrls(params: {
   pushCandidate(readNestedString(params.channelData, ["messageId"]));
   pushCandidate(readNestedString(params.channelData, ["teamsMessageId"]));
 
-  const replyToId = typeof params.replyToId === "string" ? params.replyToId.trim() : "";
+  const replyToId = normalizeOptionalString(params.replyToId) ?? "";
 
   if (conversationType === "channel") {
     const teamId =
@@ -181,6 +178,7 @@ async function downloadGraphHostedContent(params: {
   fetchFn?: typeof fetch;
   preserveFilenames?: boolean;
   ssrfPolicy?: SsrFPolicy;
+  logger?: MSTeamsAttachmentDownloadLogger;
 }): Promise<{ media: MSTeamsInboundMedia[]; status: number; count: number }> {
   const hosted = await fetchGraphCollection<GraphHostedContent>({
     url: `${params.messageUrl}/hostedContents`,
@@ -197,9 +195,15 @@ async function downloadGraphHostedContent(params: {
     const contentBytes = typeof item.contentBytes === "string" ? item.contentBytes : "";
     let buffer: Buffer;
     if (contentBytes) {
+      if (estimateBase64DecodedBytes(contentBytes) > params.maxBytes) {
+        continue;
+      }
       try {
         buffer = Buffer.from(contentBytes, "base64");
-      } catch {
+      } catch (err) {
+        params.logger?.warn?.("msteams graph hostedContent base64 decode failed", {
+          error: err instanceof Error ? err.message : String(err),
+        });
         continue;
       }
     } else if (item.id) {
@@ -229,7 +233,10 @@ async function downloadGraphHostedContent(params: {
         } finally {
           await release();
         }
-      } catch {
+      } catch (err) {
+        params.logger?.warn?.("msteams graph hostedContent value fetch failed", {
+          error: err instanceof Error ? err.message : String(err),
+        });
         continue;
       }
     } else {
@@ -255,8 +262,10 @@ async function downloadGraphHostedContent(params: {
         contentType: saved.contentType,
         placeholder: inferPlaceholder({ contentType: saved.contentType }),
       });
-    } catch {
-      // Ignore save failures.
+    } catch (err) {
+      params.logger?.warn?.("msteams graph hostedContent save failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -272,6 +281,12 @@ export async function downloadMSTeamsGraphMedia(params: {
   fetchFn?: typeof fetch;
   /** When true, embeds original filename in stored path for later extraction. */
   preserveFilenames?: boolean;
+  /**
+   * Optional logger used to surface Graph/SharePoint fetch errors. Without
+   * it, empty `catch` blocks hide failures like the Node 24+ undici
+   * incompatibility that silently broke SharePoint downloads (#63396).
+   */
+  logger?: MSTeamsAttachmentDownloadLogger;
 }): Promise<MSTeamsGraphMediaResult> {
   if (!params.messageUrl || !params.tokenProvider) {
     return { media: [] };
@@ -285,7 +300,10 @@ export async function downloadMSTeamsGraphMedia(params: {
   let accessToken: string;
   try {
     accessToken = await params.tokenProvider.getAccessToken("https://graph.microsoft.com");
-  } catch {
+  } catch (err) {
+    params.logger?.warn?.("msteams graph token acquisition failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
     return { media: [], messageUrl, tokenError: true };
   }
 
@@ -304,6 +322,11 @@ export async function downloadMSTeamsGraphMedia(params: {
       auditContext: "msteams.graph.message",
     });
     try {
+      if (!msgRes.ok) {
+        params.logger?.warn?.("msteams graph message fetch non-ok", {
+          status: msgRes.status,
+        });
+      }
       if (msgRes.ok) {
         const msgData = (await msgRes.json()) as {
           body?: { content?: string; contentType?: string };
@@ -324,13 +347,15 @@ export async function downloadMSTeamsGraphMedia(params: {
           const name = att.name ?? "file";
 
           try {
-            // SharePoint URLs need to be accessed via Graph shares API
+            // SharePoint URLs need to be accessed via Graph shares API. Validate the
+            // rewritten Graph URL, not the original SharePoint host, so the existing
+            // Graph allowlist path can fetch shared files without separately allowing
+            // arbitrary SharePoint hosts.
             const shareUrl = att.contentUrl!;
-            if (!isUrlAllowed(shareUrl, policy.allowHosts)) {
+            const sharesUrl = `${GRAPH_ROOT}/shares/${encodeGraphShareId(shareUrl)}/driveItem/content`;
+            if (!isUrlAllowed(sharesUrl, policy.allowHosts)) {
               continue;
             }
-            const encodedUrl = Buffer.from(shareUrl).toString("base64url");
-            const sharesUrl = `${GRAPH_ROOT}/shares/u!${encodedUrl}/driveItem/content`;
 
             const media = await downloadAndStoreMSTeamsRemoteMedia({
               url: sharesUrl,
@@ -339,6 +364,12 @@ export async function downloadMSTeamsGraphMedia(params: {
               contentTypeHint: "application/octet-stream",
               preserveFilenames: params.preserveFilenames,
               ssrfPolicy,
+              // The `fetchImpl` below already validates each redirect hop via
+              // `safeFetchWithPolicy`, so bypass `fetchRemoteMedia`'s strict
+              // SSRF dispatcher. That dispatcher is incompatible with Node
+              // 24+'s built-in undici v7 and silently breaks SharePoint
+              // downloads (#63396).
+              useDirectFetch: true,
               fetchImpl: async (input, init) => {
                 const requestUrl = resolveRequestUrl(input);
                 const headers = ensureUserAgentHeader(init?.headers);
@@ -361,16 +392,21 @@ export async function downloadMSTeamsGraphMedia(params: {
             });
             sharePointMedia.push(media);
             downloadedReferenceUrls.add(shareUrl);
-          } catch {
-            // Ignore SharePoint download failures.
+          } catch (err) {
+            params.logger?.warn?.("msteams SharePoint reference download failed", {
+              error: err instanceof Error ? err.message : String(err),
+              name,
+            });
           }
         }
       }
     } finally {
       await release();
     }
-  } catch {
-    // Ignore message fetch failures.
+  } catch (err) {
+    params.logger?.warn?.("msteams graph message fetch failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
   }
 
   const hosted = await downloadGraphHostedContent({
@@ -380,6 +416,7 @@ export async function downloadMSTeamsGraphMedia(params: {
     fetchFn: params.fetchFn,
     preserveFilenames: params.preserveFilenames,
     ssrfPolicy,
+    logger: params.logger,
   });
 
   const attachments = await fetchGraphCollection<GraphAttachment>({
@@ -393,7 +430,7 @@ export async function downloadMSTeamsGraphMedia(params: {
   const filteredAttachments =
     sharePointMedia.length > 0
       ? normalizedAttachments.filter((att) => {
-          const contentType = att.contentType?.toLowerCase();
+          const contentType = normalizeOptionalLowercaseString(att.contentType);
           if (contentType !== "reference") {
             return true;
           }
@@ -412,6 +449,7 @@ export async function downloadMSTeamsGraphMedia(params: {
     authAllowHosts: policy.authAllowHosts,
     fetchFn: params.fetchFn,
     preserveFilenames: params.preserveFilenames,
+    logger: params.logger,
   });
 
   return {

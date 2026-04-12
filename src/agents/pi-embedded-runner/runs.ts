@@ -15,6 +15,7 @@ import {
   logSessionStateChange,
 } from "../../logging/diagnostic.js";
 import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
+import { normalizeOptionalString } from "../../shared/string-coerce.js";
 
 export type EmbeddedPiQueueHandle = {
   kind?: "embedded";
@@ -244,8 +245,10 @@ export function requestEmbeddedRunModelSwitch(
   EMBEDDED_RUN_MODEL_SWITCH_REQUESTS.set(normalizedSessionId, {
     provider,
     model,
-    authProfileId: request.authProfileId?.trim() || undefined,
-    authProfileIdSource: request.authProfileId?.trim() ? request.authProfileIdSource : undefined,
+    authProfileId: normalizeOptionalString(request.authProfileId),
+    authProfileIdSource: normalizeOptionalString(request.authProfileId)
+      ? request.authProfileIdSource
+      : undefined,
   });
   diag.debug(
     `model switch requested: sessionId=${normalizedSessionId} provider=${provider} model=${model}`,

@@ -5,8 +5,8 @@ import { withEnv } from "../../test-utils/env.js";
 import type { TemplateContext } from "../templating.js";
 import { buildInboundMetaSystemPrompt, buildInboundUserContextPrefix } from "./inbound-meta.js";
 
-vi.mock("../../channels/plugins/index.js", () => ({
-  getChannelPlugin: (channelId: string) =>
+vi.mock("../../channels/plugins/registry-loaded.js", () => ({
+  getLoadedChannelPluginById: (channelId: string) =>
     channelId === "slack"
       ? {
           agentPrompt: {
@@ -23,7 +23,10 @@ vi.mock("../../channels/plugins/index.js", () => ({
           },
         }
       : undefined,
-  normalizeChannelId: (channelId?: string) => channelId?.trim().toLowerCase(),
+}));
+
+vi.mock("../../channels/registry.js", () => ({
+  normalizeAnyChannelId: (channelId?: string) => channelId?.trim().toLowerCase(),
 }));
 
 function parseInboundMetaPayload(text: string): Record<string, unknown> {

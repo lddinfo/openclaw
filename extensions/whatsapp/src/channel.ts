@@ -26,6 +26,7 @@ import {
   resolveWhatsAppGroupToolPolicy,
 } from "./group-policy.js";
 import { resolveWhatsAppHeartbeatRecipients } from "./heartbeat-recipients.js";
+import { checkWhatsAppHeartbeatReady } from "./heartbeat.js";
 import {
   isWhatsAppGroupJid,
   looksLikeWhatsAppTargetId,
@@ -134,6 +135,7 @@ export const whatsappPlugin: ChannelPlugin<ResolvedWhatsAppAccount> =
         describeMessageTool: ({ cfg, accountId }) =>
           describeWhatsAppMessageActions({ cfg, accountId }),
         supportsAction: ({ action }) => action === "react",
+        resolveExecutionMode: ({ action }) => (action === "react" ? "gateway" : "local"),
         handleAction: async ({ action, params, cfg, accountId, toolContext }) =>
           await (
             await loadWhatsAppChannelReactAction()
@@ -145,8 +147,8 @@ export const whatsappPlugin: ChannelPlugin<ResolvedWhatsAppAccount> =
             toolContext,
           }),
       },
+      approvalCapability: whatsappApprovalAuth,
       auth: {
-        ...whatsappApprovalAuth,
         login: async ({ cfg, accountId, runtime, verbose }) => {
           const resolvedAccountId =
             accountId?.trim() ||
@@ -162,25 +164,8 @@ export const whatsappPlugin: ChannelPlugin<ResolvedWhatsAppAccount> =
           detectWhatsAppLegacyStateMigrations({ oauthDir }),
       },
       heartbeat: {
-        checkReady: async ({ cfg, accountId, deps }) => {
-          if (cfg.web?.enabled === false) {
-            return { ok: false, reason: "whatsapp-disabled" };
-          }
-          const account = resolveWhatsAppAccount({ cfg, accountId });
-          const authExists = await (
-            deps?.webAuthExists ?? (await loadWhatsAppChannelRuntime()).webAuthExists
-          )(account.authDir);
-          if (!authExists) {
-            return { ok: false, reason: "whatsapp-not-linked" };
-          }
-          const listenerActive = deps?.hasActiveWebListener
-            ? deps.hasActiveWebListener(account.accountId)
-            : Boolean((await loadWhatsAppChannelRuntime()).getActiveWebListener(account.accountId));
-          if (!listenerActive) {
-            return { ok: false, reason: "whatsapp-not-running" };
-          }
-          return { ok: true, reason: "ok" };
-        },
+        checkReady: async ({ cfg, accountId, deps }) =>
+          await checkWhatsAppHeartbeatReady({ cfg, accountId: accountId ?? undefined, deps }),
         resolveRecipients: ({ cfg, opts }) => resolveWhatsAppHeartbeatRecipients(cfg, opts),
       },
       status: createAsyncComputedAccountStatusAdapter<ResolvedWhatsAppAccount>({

@@ -7,7 +7,7 @@ import {
 import { resolveMemorySearchConfig } from "../agents/memory-search.js";
 import { resolveApiKeyForProvider } from "../agents/model-auth.js";
 import { formatCliCommand } from "../cli/command-format.js";
-import type { OpenClawConfig } from "../config/config.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { DEFAULT_LOCAL_MODEL } from "../memory-host-sdk/engine-embeddings.js";
 import { checkQmdBinaryAvailability } from "../memory-host-sdk/engine-qmd.js";
@@ -23,6 +23,7 @@ import {
   getActiveMemorySearchManager,
   resolveActiveMemoryBackendConfig,
 } from "../plugins/memory-runtime.js";
+import { normalizeOptionalString } from "../shared/string-coerce.js";
 import { note } from "../terminal/note.js";
 import { resolveUserPath } from "../utils.js";
 import type { DoctorPrompter } from "./doctor-prompter.js";
@@ -358,7 +359,8 @@ export async function noteMemorySearchHealth(
  */
 function hasLocalEmbeddings(local: { modelPath?: string }, useDefaultFallback = false): boolean {
   const modelPath =
-    local.modelPath?.trim() || (useDefaultFallback ? DEFAULT_LOCAL_MODEL : undefined);
+    normalizeOptionalString(local.modelPath) ||
+    (useDefaultFallback ? DEFAULT_LOCAL_MODEL : undefined);
   if (!modelPath) {
     return false;
   }

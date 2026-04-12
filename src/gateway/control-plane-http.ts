@@ -464,6 +464,8 @@ type PortalRunRecord = {
   endedAt?: string;
   durationMs?: number;
   reply?: string;
+  streamSeq?: number;
+  replyUpdatedAt?: string;
   usage?: PortalUsage;
   error?: {
     message: string;
@@ -2427,6 +2429,7 @@ export async function handleControlPlaneHttpRequest(
       traceId: traceId ?? session.traceId,
       status: "started",
       startedAt: runStartedAt,
+      streamSeq: 0,
       timeline: [{ phase: "started", at: runStartedAt }],
     });
 
@@ -2472,6 +2475,16 @@ export async function handleControlPlaneHttpRequest(
             return;
           }
           sawAssistantDelta = true;
+          const currentRun = portalRuns.get(runId);
+          if (currentRun && !currentRun.endedAt) {
+            const nextReply = `${currentRun.reply ?? ""}${delta}`;
+            savePortalRun({
+              ...currentRun,
+              reply: nextReply,
+              streamSeq: (currentRun.streamSeq ?? 0) + 1,
+              replyUpdatedAt: new Date(evt.ts).toISOString(),
+            });
+          }
           writePortalStreamEvent(res, "assistant.delta", {
             runId,
             traceId: traceId ?? nextSession.traceId ?? null,
@@ -3296,6 +3309,16 @@ export async function handleControlPlaneHttpRequest(
               return;
             }
             bufferedDeltas.push(delta);
+            const currentRun = portalRuns.get(lastRunId) ?? updatedRun ?? existingRun;
+            if (currentRun && lastRunId && !currentRun.endedAt) {
+              const nextReply = `${currentRun.reply ?? ""}${delta}`;
+              savePortalRun({
+                ...currentRun,
+                reply: nextReply,
+                streamSeq: (currentRun.streamSeq ?? 0) + 1,
+                replyUpdatedAt: new Date(evt.ts).toISOString(),
+              });
+            }
             writePortalStreamEvent(res, "assistant.delta", {
               runId: lastRunId,
               traceId: session.traceId ?? null,

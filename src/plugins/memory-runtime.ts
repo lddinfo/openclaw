@@ -1,3 +1,4 @@
+import type { AgentPortalContext } from "../agents/command/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolveRuntimePluginRegistry } from "./loader.js";
 import { getMemoryRuntime } from "./memory-state.js";
@@ -21,6 +22,7 @@ export async function getActiveMemorySearchManager(params: {
   cfg: OpenClawConfig;
   agentId: string;
   purpose?: "default" | "status";
+  portalContext?: AgentPortalContext;
 }) {
   const runtime = ensureMemoryRuntime(params.cfg);
   if (!runtime) {
@@ -29,7 +31,11 @@ export async function getActiveMemorySearchManager(params: {
   return await runtime.getMemorySearchManager(params);
 }
 
-export function resolveActiveMemoryBackendConfig(params: { cfg: OpenClawConfig; agentId: string }) {
+export function resolveActiveMemoryBackendConfig(params: {
+  cfg: OpenClawConfig;
+  agentId: string;
+  portalContext?: AgentPortalContext;
+}) {
   return ensureMemoryRuntime(params.cfg)?.resolveMemoryBackendConfig(params) ?? null;
 }
 

@@ -216,7 +216,13 @@ describe("memory plugin state", () => {
 
     expect(listMemoryCorpusSupplements()).toHaveLength(1);
     await expect(
-      listMemoryCorpusSupplements()[0]?.supplement.search({ query: "alpha" }),
+      listMemoryCorpusSupplements()[0]?.supplement.search({
+        query: "alpha",
+        portalContext: {
+          mode: "training",
+          conversationView: "training",
+        },
+      }),
     ).resolves.toEqual([{ corpus: "wiki", path: "sources/alpha.md", score: 1, snippet: "x" }]);
   });
 

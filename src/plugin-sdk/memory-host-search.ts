@@ -1,3 +1,4 @@
+import type { AgentPortalContext } from "../agents/command/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { RegisteredMemorySearchManager } from "../plugins/memory-state.js";
 
@@ -18,6 +19,7 @@ export async function getActiveMemorySearchManager(params: {
   cfg: OpenClawConfig;
   agentId: string;
   purpose?: ActiveMemorySearchPurpose;
+  portalContext?: AgentPortalContext;
 }): Promise<ActiveMemorySearchManagerResult> {
   const runtime = await loadMemoryHostSearchRuntime();
   return await runtime.getActiveMemorySearchManager(params);

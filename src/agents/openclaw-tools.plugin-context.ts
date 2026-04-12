@@ -2,6 +2,7 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { normalizeDeliveryContext } from "../utils/delivery-context.js";
 import type { GatewayMessageChannel } from "../utils/message-channel.js";
 import { resolveAgentWorkspaceDir, resolveSessionAgentId } from "./agent-scope.js";
+import type { AgentPortalContext } from "./command/types.js";
 import type { ToolFsPolicy } from "./tool-fs-policy.js";
 import { resolveWorkspaceRoot } from "./workspace-dir.js";
 
@@ -18,6 +19,7 @@ export type OpenClawPluginToolOptions = {
   requesterSenderId?: string | null;
   senderIsOwner?: boolean;
   sessionId?: string;
+  portalContext?: AgentPortalContext;
   sandboxBrowserBridgeUrl?: string;
   allowHostBrowserControl?: boolean;
   sandboxed?: boolean;
@@ -65,6 +67,7 @@ export function resolveOpenClawPluginToolInputs(params: {
       deliveryContext,
       requesterSenderId: options?.requesterSenderId ?? undefined,
       senderIsOwner: options?.senderIsOwner ?? undefined,
+      portalContext: options?.portalContext,
       sandboxed: options?.sandboxed,
     },
     allowGatewaySubagentBinding: options?.allowGatewaySubagentBinding,

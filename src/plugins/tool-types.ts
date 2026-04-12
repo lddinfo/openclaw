@@ -1,3 +1,4 @@
+import type { AgentPortalContext } from "../agents/command/types.js";
 import type { ToolFsPolicy } from "../agents/tool-fs-policy.js";
 import type { AnyAgentTool } from "../agents/tools/common.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -29,6 +30,11 @@ export type OpenClawPluginToolContext = {
   requesterSenderId?: string;
   /** Whether the trusted sender is an owner. */
   senderIsOwner?: boolean;
+  /**
+   * Trusted portal session metadata when the tool run originates from a control-plane
+   * managed portal session. Plugins can use this to enforce training vs serving policy.
+   */
+  portalContext?: AgentPortalContext;
   sandboxed?: boolean;
 };
 

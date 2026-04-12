@@ -4,6 +4,7 @@ import { getActiveRuntimeWebToolsMetadata } from "../secrets/runtime.js";
 import { normalizeDeliveryContext } from "../utils/delivery-context.js";
 import type { GatewayMessageChannel } from "../utils/message-channel.js";
 import { resolveAgentWorkspaceDir, resolveSessionAgentIds } from "./agent-scope.js";
+import type { AgentPortalContext } from "./command/types.js";
 import { resolveOpenClawPluginToolsForOptions } from "./openclaw-plugin-tools.js";
 import { applyNodesToolWorkspaceGuard } from "./openclaw-tools.nodes-workspace-guard.js";
 import {
@@ -101,6 +102,8 @@ export function createOpenClawTools(
     requesterSenderId?: string | null;
     /** Whether the requesting sender is an owner. */
     senderIsOwner?: boolean;
+    /** Trusted portal session metadata for portal-originated tool runs. */
+    portalContext?: AgentPortalContext;
     /** Ephemeral session UUID — regenerated on /new and /reset. */
     sessionId?: string;
     /**

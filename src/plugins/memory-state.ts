@@ -1,3 +1,4 @@
+import type { AgentPortalContext } from "../agents/command/types.js";
 import type { MemoryCitationsMode } from "../config/types.memory.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { MemorySearchManager } from "../memory-host-sdk/host/types.js";
@@ -45,12 +46,14 @@ export type MemoryCorpusSupplement = {
     query: string;
     maxResults?: number;
     agentSessionKey?: string;
+    portalContext?: AgentPortalContext;
   }): Promise<MemoryCorpusSearchResult[]>;
   get(params: {
     lookup: string;
     fromLine?: number;
     lineCount?: number;
     agentSessionKey?: string;
+    portalContext?: AgentPortalContext;
   }): Promise<MemoryCorpusGetResult | null>;
 };
 
@@ -98,6 +101,7 @@ export type MemoryPluginRuntime = {
     cfg: OpenClawConfig;
     agentId: string;
     purpose?: "default" | "status";
+    portalContext?: AgentPortalContext;
   }): Promise<{
     manager: RegisteredMemorySearchManager | null;
     error?: string;
@@ -105,6 +109,7 @@ export type MemoryPluginRuntime = {
   resolveMemoryBackendConfig(params: {
     cfg: OpenClawConfig;
     agentId: string;
+    portalContext?: AgentPortalContext;
   }): MemoryRuntimeBackendConfig;
   closeAllMemorySearchManagers?(): Promise<void>;
 };

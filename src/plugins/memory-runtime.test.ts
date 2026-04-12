@@ -159,6 +159,43 @@ describe("memory runtime auto-enable loading", () => {
     await expectAutoEnabledMemoryRuntimeCase({ run, expectedResult });
   });
 
+  it("threads portalContext through memory runtime calls", async () => {
+    const runtime = createMemoryRuntimeFixture();
+    const portalContext = {
+      mode: "training",
+      conversationView: "training",
+      writePolicy: {
+        core: "candidate-core",
+        memory: "candidate-core",
+      },
+    } as const;
+    getMemoryRuntimeMock.mockReturnValue(runtime);
+
+    await getActiveMemorySearchManager({
+      cfg: {} as never,
+      agentId: "main",
+      purpose: "default",
+      portalContext,
+    });
+    resolveActiveMemoryBackendConfig({
+      cfg: {} as never,
+      agentId: "main",
+      portalContext,
+    });
+
+    expect(runtime.getMemorySearchManager).toHaveBeenCalledWith({
+      cfg: {} as never,
+      agentId: "main",
+      purpose: "default",
+      portalContext,
+    });
+    expect(runtime.resolveMemoryBackendConfig).toHaveBeenCalledWith({
+      cfg: {} as never,
+      agentId: "main",
+      portalContext,
+    });
+  });
+
   it.each([
     {
       name: "does not bootstrap the memory runtime just to close managers",

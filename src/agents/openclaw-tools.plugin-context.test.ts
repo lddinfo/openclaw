@@ -22,6 +22,35 @@ describe("openclaw plugin tool context", () => {
     );
   });
 
+  it("forwards portal session policy context", () => {
+    const result = resolveOpenClawPluginToolInputs({
+      options: {
+        config: {} as never,
+        portalContext: {
+          mode: "chat",
+          conversationView: "serving",
+          writePolicy: {
+            core: "forbidden",
+            memory: "user-memory",
+          },
+        },
+      },
+    });
+
+    expect(result.context).toEqual(
+      expect.objectContaining({
+        portalContext: {
+          mode: "chat",
+          conversationView: "serving",
+          writePolicy: {
+            core: "forbidden",
+            memory: "user-memory",
+          },
+        },
+      }),
+    );
+  });
+
   it("forwards fs policy for plugin tool sandbox enforcement", () => {
     const result = resolveOpenClawPluginToolInputs({
       options: {

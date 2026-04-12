@@ -502,6 +502,64 @@ const portalSessions = new Map<string, PortalSessionRecord>();
 const portalRuns = new Map<string, PortalRunRecord>();
 const portalRunAbortControllers = new Map<string, AbortController>();
 
+function abortTrackedPortalRun(runId: string): {
+  aborted: boolean;
+  stoppedAt?: string;
+  remoteSessionId?: string | null;
+  portalSessionId?: string | null;
+} {
+  const abortController = portalRunAbortControllers.get(runId);
+  const existingRun = portalRuns.get(runId);
+  const remoteSessionId = existingRun?.remoteSessionId ?? null;
+  const portalSessionId = existingRun?.portalSessionId ?? null;
+  if (!abortController) {
+    return {
+      aborted: false,
+      remoteSessionId,
+      portalSessionId,
+    };
+  }
+
+  abortController.abort();
+  portalRunAbortControllers.delete(runId);
+
+  const stoppedAt = new Date().toISOString();
+  if (existingRun && !existingRun.endedAt) {
+    savePortalRun({
+      ...existingRun,
+      status: "stopped",
+      endedAt: stoppedAt,
+      durationMs: Math.max(0, Date.parse(stoppedAt) - Date.parse(existingRun.startedAt)),
+      error: {
+        message: "Portal run aborted by user",
+        code: "PORTAL_RUN_ABORTED",
+      },
+      timeline: appendPortalRunTimeline(existingRun, {
+        phase: "stopped",
+        at: stoppedAt,
+        error: "Portal run aborted by user",
+      }),
+    });
+  }
+
+  if (remoteSessionId) {
+    const session = portalSessions.get(remoteSessionId);
+    if (session) {
+      portalSessions.set(remoteSessionId, {
+        ...session,
+        updatedAt: stoppedAt,
+      });
+    }
+  }
+
+  return {
+    aborted: true,
+    stoppedAt,
+    remoteSessionId,
+    portalSessionId,
+  };
+}
+
 function isJsonObject(value: unknown): value is JsonObject {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -2299,66 +2357,51 @@ export async function handleControlPlaneHttpRequest(
       return true;
     }
     const remoteSessionId = portalMessageAbortMatch[1] ?? "";
+    const body = await readBody(req);
     const session = portalSessions.get(remoteSessionId);
-    if (!session) {
+    const runId = readOptionalString(body, "runId") ?? session?.lastRunId ?? null;
+    if (!session && !runId) {
       sendJson(res, 404, { ok: false, error: "session not found", remoteSessionId });
       return true;
     }
-    const body = await readBody(req);
-    const runId = readOptionalString(body, "runId") ?? session.lastRunId ?? null;
     if (!runId) {
       sendJson(res, 200, {
         ok: true,
         aborted: false,
         runId: null,
         remoteSessionId,
-        portalSessionId: session.portalSessionId ?? null,
+        portalSessionId: session?.portalSessionId ?? null,
       });
       return true;
     }
-    const abortController = portalRunAbortControllers.get(runId);
-    if (!abortController) {
-      sendJson(res, 200, {
-        ok: true,
-        aborted: false,
-        runId,
-        remoteSessionId,
-        portalSessionId: session.portalSessionId ?? null,
-      });
-      return true;
-    }
-    abortController.abort();
-    portalRunAbortControllers.delete(runId);
-    const stoppedAt = new Date().toISOString();
-    const existingRun = portalRuns.get(runId);
-    if (existingRun && !existingRun.endedAt) {
-      savePortalRun({
-        ...existingRun,
-        status: "stopped",
-        endedAt: stoppedAt,
-        durationMs: Math.max(0, Date.parse(stoppedAt) - Date.parse(existingRun.startedAt)),
-        error: {
-          message: "Portal run aborted by user",
-          code: "PORTAL_RUN_ABORTED",
-        },
-        timeline: appendPortalRunTimeline(existingRun, {
-          phase: "stopped",
-          at: stoppedAt,
-          error: "Portal run aborted by user",
-        }),
-      });
-    }
-    portalSessions.set(remoteSessionId, {
-      ...session,
-      updatedAt: stoppedAt,
-    });
+    const abortResult = abortTrackedPortalRun(runId);
     sendJson(res, 200, {
       ok: true,
-      aborted: true,
+      aborted: abortResult.aborted,
       runId,
-      remoteSessionId,
-      portalSessionId: session.portalSessionId ?? null,
-      stoppedAt,
+      remoteSessionId: abortResult.remoteSessionId ?? remoteSessionId,
+      portalSessionId: abortResult.portalSessionId ?? session?.portalSessionId ?? null,
+      stoppedAt: abortResult.stoppedAt,
+    });
+    return true;
+  }
+
+  const portalRunAbortMatch = url.pathname.match(
+    new RegExp(`^${PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/portal/runs/([^/]+)/abort$`),
+  );
+  if (portalRunAbortMatch) {
+    if (!ensureMethod(req, res, "POST")) {
+      return true;
+    }
+    const runId = portalRunAbortMatch[1] ?? "";
+    const abortResult = abortTrackedPortalRun(runId);
+    sendJson(res, 200, {
+      ok: true,
+      aborted: abortResult.aborted,
+      runId,
+      remoteSessionId: abortResult.remoteSessionId ?? null,
+      portalSessionId: abortResult.portalSessionId ?? null,
+      stoppedAt: abortResult.stoppedAt,
     });
     return true;
   }

@@ -2891,7 +2891,9 @@ export async function handleControlPlaneHttpRequest(
         }
         writePortalStreamEvent(res, "runtime.event", runtimeEvent);
       });
-      req.on("close", () => {
+      // For POST + SSE, the request stream can close once the body is fully read.
+      // We only want to stop forwarding when the response stream is actually closed.
+      res.on("close", () => {
         if (streamClosed) {
           return;
         }
@@ -3679,7 +3681,8 @@ export async function handleControlPlaneHttpRequest(
           finishStream("complete");
         }, 15000);
       };
-      req.on("close", () => {
+      // Keep the approval continuation stream alive until the response closes.
+      res.on("close", () => {
         streamClosed = true;
         clearIdleTimer();
         unsubscribe();

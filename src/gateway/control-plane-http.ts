@@ -1906,6 +1906,17 @@ async function resolvePortalMessageAttachments(params: {
   return buildPortalMessageAttachments([...merged.values()]);
 }
 
+async function prunePortalRunDeliverablesRoot(
+  workspaceDir: string,
+  portalSessionId: string,
+  runId: string,
+): Promise<void> {
+  await pruneEmptyDirectory(
+    resolvePortalRunDeliverablesRoot(workspaceDir, portalSessionId, runId),
+    resolvePortalSessionDeliverablesRoot(workspaceDir, portalSessionId),
+  );
+}
+
 async function readPortalDeliverable(
   workspaceDir: string,
   portalSessionId: string,
@@ -3700,6 +3711,7 @@ export async function handleControlPlaneHttpRequest(
               };
             }
             portalSessions.set(remoteSessionId, persistedSession);
+            await prunePortalRunDeliverablesRoot(workspaceDir, deliverablesPortalSessionId, runId);
             const completedAt = new Date().toISOString();
             const runRecord = savePortalRun({
               runId,
@@ -3766,6 +3778,13 @@ export async function handleControlPlaneHttpRequest(
           const failureCode = aborted ? "PORTAL_RUN_ABORTED" : "PORTAL_RUN_FAILED";
           const failureStatus = aborted ? "stopped" : "failed";
           const failureMessage = aborted ? "已暂停当前执行" : message;
+          try {
+            const cfg = loadConfig();
+            const workspaceDir = resolveAgentWorkspaceDir(cfg, nextSession.agentId);
+            const deliverablesPortalSessionId =
+              portalSessionId ?? nextSession.portalSessionId ?? remoteSessionId;
+            await prunePortalRunDeliverablesRoot(workspaceDir, deliverablesPortalSessionId, runId);
+          } catch {}
           const runRecord = savePortalRun({
             runId,
             remoteSessionId,
@@ -4016,6 +4035,7 @@ export async function handleControlPlaneHttpRequest(
           };
         }
         portalSessions.set(remoteSessionId, persistedSession);
+        await prunePortalRunDeliverablesRoot(workspaceDir, deliverablesPortalSessionId, runId);
         const completedAt = new Date().toISOString();
         const runRecord = savePortalRun({
           runId,
@@ -4079,6 +4099,13 @@ export async function handleControlPlaneHttpRequest(
       const failureCode = aborted ? "PORTAL_RUN_ABORTED" : "PORTAL_RUN_FAILED";
       const failureStatus = aborted ? "stopped" : "failed";
       const failureMessage = aborted ? "已暂停当前执行" : message;
+      const cfg = loadConfig();
+      const workspaceDir = resolveAgentWorkspaceDir(cfg, nextSession.agentId);
+      const deliverablesPortalSessionId =
+        portalSessionId ?? nextSession.portalSessionId ?? remoteSessionId;
+      await prunePortalRunDeliverablesRoot(workspaceDir, deliverablesPortalSessionId, runId).catch(
+        () => undefined,
+      );
       const runRecord = savePortalRun({
         runId,
         remoteSessionId,
@@ -4284,6 +4311,11 @@ export async function handleControlPlaneHttpRequest(
               runId: lastRunId,
               reply: combinedReply,
             });
+            await prunePortalRunDeliverablesRoot(
+              workspaceDir,
+              deliverablesPortalSessionId,
+              lastRunId,
+            );
             if (currentRun) {
               currentRun = savePortalRun({
                 ...currentRun,

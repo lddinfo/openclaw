@@ -22,6 +22,7 @@ import { agentCommandFromIngress } from "../commands/agent.js";
 import { loadConfig, writeConfigFile } from "../config/config.js";
 import { onAgentEvent, type AgentEventPayload } from "../infra/agent-events.js";
 import type { ExecApprovalDecision } from "../infra/exec-approvals.js";
+import { isPathInside } from "../infra/path-guards.js";
 import type { PromptImageOrderEntry } from "../media/prompt-image-order.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import { defaultRuntime } from "../runtime.js";
@@ -475,6 +476,16 @@ type PortalRunRecord = {
   timeline: PortalRunTimelineItem[];
 };
 
+type PortalSharedFileRecord = {
+  id: string;
+  fileName: string;
+  relativePath: string;
+  sizeBytes: number;
+  mimeType: string;
+  updatedAt: string;
+  uploadedBy?: string | null;
+};
+
 type ReleaseDescriptor = {
   releaseId?: string;
   releaseVersion?: string;
@@ -497,6 +508,9 @@ const PORTAL_USER_CONTEXT_MAX_CHARS = 600;
 const PORTAL_SESSION_ROLLOVER_TURN_LIMIT = 6;
 const PORTAL_SESSION_ROLLOVER_TOKEN_LIMIT = 24_000;
 const PLATFORM_DEFAULT_FIND_SKILL_NAME = "find-base-skills";
+const PORTAL_SHARED_FILES_DIRNAME = "iqiyi_source";
+const PORTAL_SHARED_FILES_MANIFEST = ".portal-files.json";
+const PORTAL_SHARED_FILES_PROMPT_LIMIT = 20;
 
 const portalSessions = new Map<string, PortalSessionRecord>();
 const portalRuns = new Map<string, PortalRunRecord>();
@@ -895,6 +909,7 @@ function buildPortalExtraSystemPrompt(params: {
   traceId?: string;
   portalSessionId?: string;
   skillSearchPrefetch?: PortalSkillSearchPrefetch;
+  sharedFiles?: PortalSharedFileRecord[];
 }): string {
   const userContext = truncateText(
     stringifyJson(params.session.userContext),
@@ -933,6 +948,28 @@ function buildPortalExtraSystemPrompt(params: {
   }
   if (params.session.historySummary) {
     lines.push("", "## Session Memory", params.session.historySummary);
+  }
+  if ((params.sharedFiles?.length ?? 0) > 0) {
+    lines.push(
+      "",
+      "## Shared Source Files",
+      `The current agent workspace includes shared user-uploaded files under ${PORTAL_SHARED_FILES_DIRNAME}/.`,
+      "Use these files directly when the task needs workspace data; prefer them over asking the user to re-upload the same content.",
+      ...params.sharedFiles!.slice(0, PORTAL_SHARED_FILES_PROMPT_LIMIT).map((file, index) => {
+        const parts = [
+          `${index + 1}. ${PORTAL_SHARED_FILES_DIRNAME}/${file.relativePath}`,
+          `${file.sizeBytes} bytes`,
+          file.mimeType,
+          file.updatedAt ? `updatedAt=${file.updatedAt}` : undefined,
+        ].filter(Boolean);
+        return `- ${parts.join(" | ")}`;
+      }),
+    );
+    if ((params.sharedFiles?.length ?? 0) > PORTAL_SHARED_FILES_PROMPT_LIMIT) {
+      lines.push(
+        `- ...and ${params.sharedFiles!.length - PORTAL_SHARED_FILES_PROMPT_LIMIT} more shared files under ${PORTAL_SHARED_FILES_DIRNAME}/`,
+      );
+    }
   }
   if (params.session.conversationView === "training") {
     lines.push(
@@ -1274,6 +1311,193 @@ async function pathExists(targetPath: string): Promise<boolean> {
 async function writeTextFile(targetPath: string, content: string): Promise<void> {
   await fs.mkdir(path.dirname(targetPath), { recursive: true, mode: 0o700 });
   await fs.writeFile(targetPath, `${content.trimEnd()}\n`, { encoding: "utf-8", mode: 0o600 });
+}
+
+function resolvePortalSharedFilesRoot(workspaceDir: string): string {
+  return path.join(workspaceDir, PORTAL_SHARED_FILES_DIRNAME);
+}
+
+function resolvePortalSharedFilesManifestPath(workspaceDir: string): string {
+  return path.join(resolvePortalSharedFilesRoot(workspaceDir), PORTAL_SHARED_FILES_MANIFEST);
+}
+
+function normalizePortalSharedRelativePath(value: string): string | undefined {
+  const normalized = normalizeWorkspaceRelativePath(value);
+  if (!normalized) {
+    return undefined;
+  }
+  if (
+    normalized === PORTAL_SHARED_FILES_MANIFEST ||
+    normalized.startsWith(`${PORTAL_SHARED_FILES_MANIFEST}/`)
+  ) {
+    return undefined;
+  }
+  return normalized;
+}
+
+function resolvePortalSharedFilePath(workspaceDir: string, relativePath: string): string {
+  const root = resolvePortalSharedFilesRoot(workspaceDir);
+  const target = path.join(root, relativePath);
+  if (!isPathInside(root, target)) {
+    throw new Error("shared file path escapes iqiyi_source root");
+  }
+  return target;
+}
+
+async function loadPortalSharedFilesManifest(
+  workspaceDir: string,
+): Promise<PortalSharedFileRecord[]> {
+  const manifestPath = resolvePortalSharedFilesManifestPath(workspaceDir);
+  try {
+    const raw = await fs.readFile(manifestPath, "utf-8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed
+      .filter(
+        (item): item is PortalSharedFileRecord =>
+          Boolean(item) &&
+          typeof item === "object" &&
+          typeof (item as PortalSharedFileRecord).relativePath === "string" &&
+          typeof (item as PortalSharedFileRecord).fileName === "string",
+      )
+      .map((item) => ({
+        id: item.relativePath,
+        fileName: item.fileName,
+        relativePath: item.relativePath,
+        sizeBytes: Number.isFinite(item.sizeBytes) ? item.sizeBytes : 0,
+        mimeType: item.mimeType || "application/octet-stream",
+        updatedAt: item.updatedAt || new Date().toISOString(),
+        uploadedBy: item.uploadedBy ?? null,
+      }));
+  } catch {
+    return [];
+  }
+}
+
+async function savePortalSharedFilesManifest(
+  workspaceDir: string,
+  records: PortalSharedFileRecord[],
+): Promise<void> {
+  const root = resolvePortalSharedFilesRoot(workspaceDir);
+  await fs.mkdir(root, { recursive: true, mode: 0o700 });
+  const manifestPath = resolvePortalSharedFilesManifestPath(workspaceDir);
+  await fs.writeFile(manifestPath, `${JSON.stringify(records, null, 2)}\n`, {
+    encoding: "utf-8",
+    mode: 0o600,
+  });
+}
+
+async function listPortalSharedFiles(workspaceDir: string): Promise<PortalSharedFileRecord[]> {
+  const manifest = await loadPortalSharedFilesManifest(workspaceDir);
+  const next: PortalSharedFileRecord[] = [];
+  let changed = false;
+  for (const record of manifest) {
+    const normalized = normalizePortalSharedRelativePath(record.relativePath);
+    if (!normalized) {
+      changed = true;
+      continue;
+    }
+    try {
+      const targetPath = resolvePortalSharedFilePath(workspaceDir, normalized);
+      const stat = await fs.stat(targetPath);
+      if (!stat.isFile()) {
+        changed = true;
+        continue;
+      }
+      next.push({
+        ...record,
+        id: normalized,
+        fileName: path.posix.basename(normalized),
+        relativePath: normalized,
+        sizeBytes: stat.size,
+      });
+    } catch {
+      changed = true;
+    }
+  }
+  next.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+  if (changed) {
+    await savePortalSharedFilesManifest(workspaceDir, next);
+  }
+  return next;
+}
+
+async function upsertPortalSharedFiles(params: {
+  workspaceDir: string;
+  files: Array<{
+    fileName?: string;
+    relativePath?: string;
+    mimeType?: string;
+    contentBase64?: string;
+  }>;
+  overwrite?: boolean;
+  uploadedBy?: string | null;
+}): Promise<PortalSharedFileRecord[]> {
+  const root = resolvePortalSharedFilesRoot(params.workspaceDir);
+  await fs.mkdir(root, { recursive: true, mode: 0o700 });
+  const overwrite = params.overwrite !== false;
+  const manifest = await loadPortalSharedFilesManifest(params.workspaceDir);
+  const recordMap = new Map(manifest.map((item) => [item.relativePath, item]));
+  const uploaded: PortalSharedFileRecord[] = [];
+
+  for (const file of params.files) {
+    const inputPath = readOptionalString(file as JsonObject, "relativePath", "fileName");
+    const relativePath = inputPath ? normalizePortalSharedRelativePath(inputPath) : undefined;
+    if (!relativePath) {
+      throw new Error("missing or invalid relativePath");
+    }
+    const contentBase64 = readOptionalString(file as JsonObject, "contentBase64");
+    if (!contentBase64) {
+      throw new Error(`missing contentBase64 for ${relativePath}`);
+    }
+    const targetPath = resolvePortalSharedFilePath(params.workspaceDir, relativePath);
+    if (!overwrite && (await pathExists(targetPath))) {
+      throw new Error(`shared file already exists: ${relativePath}`);
+    }
+    const buffer = Buffer.from(contentBase64, "base64");
+    const now = new Date().toISOString();
+    const tempPath = `${targetPath}.tmp-${randomUUID().replace(/-/g, "")}`;
+    await fs.mkdir(path.dirname(targetPath), { recursive: true, mode: 0o700 });
+    await fs.writeFile(tempPath, buffer, { mode: 0o600 });
+    await fs.rename(tempPath, targetPath);
+    const stat = await fs.stat(targetPath);
+    const record: PortalSharedFileRecord = {
+      id: relativePath,
+      fileName: path.posix.basename(relativePath),
+      relativePath,
+      sizeBytes: stat.size,
+      mimeType: readOptionalString(file as JsonObject, "mimeType") ?? "application/octet-stream",
+      updatedAt: now,
+      uploadedBy: params.uploadedBy ?? null,
+    };
+    recordMap.set(relativePath, record);
+    uploaded.push(record);
+  }
+
+  const next = [...recordMap.values()].toSorted((a, b) =>
+    a.relativePath.localeCompare(b.relativePath),
+  );
+  await savePortalSharedFilesManifest(params.workspaceDir, next);
+  return uploaded;
+}
+
+async function deletePortalSharedFile(
+  workspaceDir: string,
+  fileIdOrRelativePath: string,
+): Promise<PortalSharedFileRecord | null> {
+  const relativePath = normalizePortalSharedRelativePath(fileIdOrRelativePath);
+  if (!relativePath) {
+    throw new Error("missing or invalid shared file id");
+  }
+  const manifest = await loadPortalSharedFilesManifest(workspaceDir);
+  const current = manifest.find((item) => item.relativePath === relativePath) ?? null;
+  const targetPath = resolvePortalSharedFilePath(workspaceDir, relativePath);
+  await fs.rm(targetPath, { force: true });
+  const next = manifest.filter((item) => item.relativePath !== relativePath);
+  await savePortalSharedFilesManifest(workspaceDir, next);
+  return current;
 }
 
 async function copyFileIfMissing(sourcePath: string, targetPath: string): Promise<void> {
@@ -2200,6 +2424,118 @@ export async function handleControlPlaneHttpRequest(
     return true;
   }
 
+  const sharedFilesMatch = url.pathname.match(
+    new RegExp(`^${PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/agents/([^/]+)/files$`),
+  );
+  if (sharedFilesMatch) {
+    const remoteAgentId = sharedFilesMatch[1] ?? "";
+    const resolvedTarget = resolvePortalTargetAgent(remoteAgentId);
+    if (!resolvedTarget) {
+      sendJson(res, 404, {
+        error: "remote agent is not synced to a local OpenClaw agent",
+        remoteAgentId,
+      });
+      return true;
+    }
+    const workspaceDir = resolveAgentWorkspaceDir(resolvedTarget.cfg, resolvedTarget.agentId);
+    if (req.method === "GET") {
+      const files = await listPortalSharedFiles(workspaceDir);
+      sendJson(res, 200, {
+        ok: true,
+        remoteAgentId,
+        agentId: resolvedTarget.agentId,
+        sourceDir: PORTAL_SHARED_FILES_DIRNAME,
+        files,
+      });
+      return true;
+    }
+    if (req.method === "POST") {
+      const body = await readBody(req);
+      const files = Array.isArray(body.files)
+        ? body.files.filter(
+            (item): item is JsonObject =>
+              Boolean(item) && typeof item === "object" && !Array.isArray(item),
+          )
+        : [];
+      if (files.length === 0) {
+        sendJson(res, 400, { error: "missing files" });
+        return true;
+      }
+      try {
+        const actor = readOptionalObject(body, "actor");
+        const uploaded = await upsertPortalSharedFiles({
+          workspaceDir,
+          files: files.map((item) => ({
+            fileName: readOptionalString(item, "fileName"),
+            relativePath: readOptionalString(item, "relativePath", "fileName"),
+            mimeType: readOptionalString(item, "mimeType"),
+            contentBase64: readOptionalString(item, "contentBase64"),
+          })),
+          overwrite: body.overwrite !== false,
+          uploadedBy:
+            readOptionalString(actor, "username", "userId") ??
+            readOptionalString(body, "uploadedBy", "username", "userId") ??
+            null,
+        });
+        sendJson(res, 200, {
+          ok: true,
+          remoteAgentId,
+          agentId: resolvedTarget.agentId,
+          sourceDir: PORTAL_SHARED_FILES_DIRNAME,
+          files: uploaded,
+        });
+      } catch (error) {
+        sendJson(res, 400, {
+          error: error instanceof Error ? error.message : String(error),
+          remoteAgentId,
+          agentId: resolvedTarget.agentId,
+        });
+      }
+      return true;
+    }
+    if (!ensureMethod(req, res, ["GET", "POST"])) {
+      return true;
+    }
+  }
+
+  const sharedFileDeleteMatch = url.pathname.match(
+    new RegExp(`^${PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/agents/([^/]+)/files/(.+)$`),
+  );
+  if (sharedFileDeleteMatch) {
+    if (!ensureMethod(req, res, "DELETE")) {
+      return true;
+    }
+    const remoteAgentId = sharedFileDeleteMatch[1] ?? "";
+    const fileId = decodeURIComponent(sharedFileDeleteMatch[2] ?? "");
+    const resolvedTarget = resolvePortalTargetAgent(remoteAgentId);
+    if (!resolvedTarget) {
+      sendJson(res, 404, {
+        error: "remote agent is not synced to a local OpenClaw agent",
+        remoteAgentId,
+      });
+      return true;
+    }
+    try {
+      const deleted = await deletePortalSharedFile(
+        resolveAgentWorkspaceDir(resolvedTarget.cfg, resolvedTarget.agentId),
+        fileId,
+      );
+      sendJson(res, 200, {
+        ok: true,
+        remoteAgentId,
+        agentId: resolvedTarget.agentId,
+        deleted,
+      });
+    } catch (error) {
+      sendJson(res, 400, {
+        error: error instanceof Error ? error.message : String(error),
+        remoteAgentId,
+        agentId: resolvedTarget.agentId,
+      });
+    }
+    return true;
+  }
+
   if (url.pathname === `${PREFIX}/portal/sessions`) {
     if (!ensureMethod(req, res, "POST")) {
       return true;
@@ -2582,6 +2918,9 @@ export async function handleControlPlaneHttpRequest(
       void (async () => {
         try {
           const cfg = loadConfig();
+          const sharedFiles = await listPortalSharedFiles(
+            resolveAgentWorkspaceDir(cfg, nextSession.agentId),
+          );
           const result = await agentCommandFromIngress(
             {
               message: effectiveMessage,
@@ -2601,6 +2940,7 @@ export async function handleControlPlaneHttpRequest(
                 traceId,
                 portalSessionId,
                 skillSearchPrefetch,
+                sharedFiles,
               }),
               portalContext: buildPortalPluginContext({
                 session: nextSession,
@@ -2881,6 +3221,9 @@ export async function handleControlPlaneHttpRequest(
     portalRunAbortControllers.set(runId, runAbortController);
     try {
       const cfg = loadConfig();
+      const sharedFiles = await listPortalSharedFiles(
+        resolveAgentWorkspaceDir(cfg, nextSession.agentId),
+      );
       const result = await agentCommandFromIngress(
         {
           message: effectiveMessage,
@@ -2900,6 +3243,7 @@ export async function handleControlPlaneHttpRequest(
             traceId,
             portalSessionId,
             skillSearchPrefetch,
+            sharedFiles,
           }),
           portalContext: buildPortalPluginContext({
             session: nextSession,

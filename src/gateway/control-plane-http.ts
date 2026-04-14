@@ -444,7 +444,7 @@ type PortalSkillSearchPrefetch = ControlPlaneSkillSearchResult & {
 };
 
 type PortalRunTimelineItem = {
-  phase: "started" | "requires_approval" | "completed" | "failed" | "approval_applied";
+  phase: "started" | "requires_approval" | "completed" | "failed" | "approval_applied" | "stopped";
   at: string;
   error?: string;
 };
@@ -473,6 +473,7 @@ type PortalRunRecord = {
     code?: string;
   };
   candidateChanges?: PortalCandidateChange[];
+  attachments?: PortalMessageAttachment[];
   timeline: PortalRunTimelineItem[];
 };
 
@@ -499,6 +500,23 @@ type PortalDeliverableRecord = {
   updatedAt: string;
   expiresAt: string;
   previewType: PortalDeliverablePreviewType;
+};
+
+type PortalMessageAttachment = {
+  id: string;
+  kind: "file";
+  fileName: string;
+  relativePath: string;
+  runId: string;
+  sizeBytes: number;
+  mimeType: string;
+  createdAt: string;
+  updatedAt: string;
+  expiresAt: string;
+  previewType: PortalDeliverablePreviewType;
+  transport: {
+    mode: "managed-download";
+  };
 };
 
 type ReleaseDescriptor = {
@@ -1814,6 +1832,38 @@ async function listPortalDeliverablesForSession(
   return records.toSorted((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
+function buildPortalMessageAttachments(
+  deliverables: PortalDeliverableRecord[],
+): PortalMessageAttachment[] {
+  return deliverables.map((deliverable) => ({
+    id: deliverable.id,
+    kind: "file",
+    fileName: deliverable.fileName,
+    relativePath: deliverable.relativePath,
+    runId: deliverable.runId,
+    sizeBytes: deliverable.sizeBytes,
+    mimeType: deliverable.mimeType,
+    createdAt: deliverable.createdAt,
+    updatedAt: deliverable.updatedAt,
+    expiresAt: deliverable.expiresAt,
+    previewType: deliverable.previewType,
+    transport: {
+      mode: "managed-download",
+    },
+  }));
+}
+
+async function listPortalMessageAttachmentsForRun(
+  workspaceDir: string,
+  portalSessionId: string,
+  runId: string,
+): Promise<PortalMessageAttachment[]> {
+  const deliverables = await listPortalDeliverablesForSession(workspaceDir, portalSessionId);
+  return buildPortalMessageAttachments(
+    deliverables.filter((deliverable) => deliverable.runId === runId),
+  );
+}
+
 async function readPortalDeliverable(
   workspaceDir: string,
   portalSessionId: string,
@@ -2839,7 +2889,7 @@ export async function handleControlPlaneHttpRequest(
           })),
           overwrite: body.overwrite !== false,
           uploadedBy:
-            readOptionalString(actor, "username", "userId") ??
+            (actor ? readOptionalString(actor, "username", "userId") : undefined) ??
             readOptionalString(body, "uploadedBy", "username", "userId") ??
             null,
         });
@@ -3458,6 +3508,11 @@ export async function handleControlPlaneHttpRequest(
           );
           const reply = resolvePortalReplyText(result);
           const usage = extractPortalUsage(result);
+          const outputAttachments = await listPortalMessageAttachmentsForRun(
+            workspaceDir,
+            deliverablesPortalSessionId,
+            runId,
+          );
           if (reply === EMPTY_PORTAL_REPLY) {
             defaultRuntime.log(
               `[control-plane] portal session produced no visible reply (runId=${runId}, traceId=${traceId}, remoteSessionId=${remoteSessionId}, agentId=${nextSession.agentId})`,
@@ -3534,6 +3589,7 @@ export async function handleControlPlaneHttpRequest(
               durationMs: Math.max(0, Date.parse(approvalTime) - Date.parse(runStartedAt)),
               reply,
               usage,
+              attachments: outputAttachments,
               candidateChanges,
               timeline: appendPortalRunTimeline(portalRuns.get(runId), {
                 phase: "requires_approval",
@@ -3575,6 +3631,7 @@ export async function handleControlPlaneHttpRequest(
                 timeline: runRecord.timeline,
                 approval,
                 candidateChanges,
+                attachments: outputAttachments,
                 runtimeEvents: [runStartedEvent, approvalRequiredEvent],
               });
             }
@@ -3612,6 +3669,7 @@ export async function handleControlPlaneHttpRequest(
               durationMs: Math.max(0, Date.parse(completedAt) - Date.parse(runStartedAt)),
               reply,
               usage,
+              attachments: outputAttachments,
               candidateChanges,
               timeline: appendPortalRunTimeline(portalRuns.get(runId), {
                 phase: "completed",
@@ -3652,6 +3710,7 @@ export async function handleControlPlaneHttpRequest(
                 releaseVersion: nextSession.releaseVersion,
                 releaseStatus: nextSession.releaseStatus,
                 timeline: runRecord.timeline,
+                attachments: outputAttachments,
                 candidateChanges,
                 runtimeEvents: [runStartedEvent, runCompletedEvent],
               });
@@ -3771,6 +3830,11 @@ export async function handleControlPlaneHttpRequest(
       );
       const reply = resolvePortalReplyText(result);
       const usage = extractPortalUsage(result);
+      const outputAttachments = await listPortalMessageAttachmentsForRun(
+        workspaceDir,
+        deliverablesPortalSessionId,
+        runId,
+      );
       if (reply === EMPTY_PORTAL_REPLY) {
         defaultRuntime.log(
           `[control-plane] portal session produced no visible reply (runId=${runId}, traceId=${traceId}, remoteSessionId=${remoteSessionId}, agentId=${nextSession.agentId})`,
@@ -3838,6 +3902,7 @@ export async function handleControlPlaneHttpRequest(
           durationMs: Math.max(0, Date.parse(approvalTime) - Date.parse(runStartedAt)),
           reply,
           usage,
+          attachments: outputAttachments,
           candidateChanges,
           timeline: appendPortalRunTimeline(portalRuns.get(runId), {
             phase: "requires_approval",
@@ -3882,6 +3947,7 @@ export async function handleControlPlaneHttpRequest(
           timeline: runRecord.timeline,
           approval,
           candidateChanges,
+          attachments: outputAttachments,
           runtimeEvents: [runStartedEvent, approvalRequiredEvent],
         });
       } else {
@@ -3918,6 +3984,7 @@ export async function handleControlPlaneHttpRequest(
           durationMs: Math.max(0, Date.parse(completedAt) - Date.parse(runStartedAt)),
           reply,
           usage,
+          attachments: outputAttachments,
           candidateChanges,
           timeline: appendPortalRunTimeline(portalRuns.get(runId), {
             phase: "completed",
@@ -3956,6 +4023,7 @@ export async function handleControlPlaneHttpRequest(
           releaseVersion: nextSession.releaseVersion,
           releaseStatus: nextSession.releaseStatus,
           timeline: runRecord.timeline,
+          attachments: outputAttachments,
           candidateChanges,
           runtimeEvents: [runStartedEvent, runCompletedEvent],
         });
@@ -4143,20 +4211,44 @@ export async function handleControlPlaneHttpRequest(
           idleTimer = null;
         }
       };
-      const finishStream = (kind: "complete" | "error", override?: Record<string, unknown>) => {
+      const finishStream = async (
+        kind: "complete" | "error",
+        override?: Record<string, unknown>,
+      ) => {
         if (streamClosed) {
           return;
         }
         streamClosed = true;
         clearIdleTimer();
         unsubscribe();
-        const currentRun = lastRunId ? (portalRuns.get(lastRunId) ?? updatedRun) : updatedRun;
+        let currentRun = lastRunId ? (portalRuns.get(lastRunId) ?? updatedRun) : updatedRun;
         const continuedReply = bufferedDeltas.join("");
         const priorReply = currentRun?.reply ?? existingRun?.reply ?? "";
         const combinedReply =
           continuedReply.trim().length > 0
             ? [priorReply, continuedReply].filter(Boolean).join("\n\n").trim()
             : priorReply || undefined;
+        let outputAttachments = currentRun?.attachments ?? [];
+        if (lastRunId) {
+          try {
+            const cfg = loadConfig();
+            const workspaceDir = resolveAgentWorkspaceDir(cfg, session.agentId);
+            const deliverablesPortalSessionId = session.portalSessionId ?? remoteSessionId;
+            outputAttachments = await listPortalMessageAttachmentsForRun(
+              workspaceDir,
+              deliverablesPortalSessionId,
+              lastRunId,
+            );
+            if (currentRun) {
+              currentRun = savePortalRun({
+                ...currentRun,
+                attachments: outputAttachments,
+              });
+            }
+          } catch {
+            outputAttachments = currentRun?.attachments ?? [];
+          }
+        }
         const payload = {
           decision: decisionRaw,
           status:
@@ -4175,6 +4267,7 @@ export async function handleControlPlaneHttpRequest(
           durationMs: currentRun?.durationMs,
           reply: combinedReply ?? "",
           usage: currentRun?.usage,
+          attachments: outputAttachments,
           timeline: currentRun?.timeline,
           runtimeEvents: streamedRuntimeEvents,
           ...override,
@@ -4190,7 +4283,7 @@ export async function handleControlPlaneHttpRequest(
       const touchIdleTimer = () => {
         clearIdleTimer();
         idleTimer = setTimeout(() => {
-          finishStream("complete");
+          void finishStream("complete");
         }, 15000);
       };
       // Keep the approval continuation stream alive until the response closes.
@@ -4261,7 +4354,7 @@ export async function handleControlPlaneHttpRequest(
                 });
                 portalRuns.set(lastRunId, nextRun);
               }
-              finishStream(
+              void finishStream(
                 lifecyclePhase === "error" ? "error" : "complete",
                 lifecyclePhase === "error"
                   ? {
@@ -4277,7 +4370,7 @@ export async function handleControlPlaneHttpRequest(
       }
       writePortalStreamEvent(res, "runtime.event", approvalAppliedEvent);
       if (decisionRaw === "deny" || !lastRunId) {
-        finishStream("complete", {
+        void finishStream("complete", {
           status: decisionRaw === "deny" ? "denied" : "applied",
           timeline: updatedRun?.timeline,
         });

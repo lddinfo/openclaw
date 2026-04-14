@@ -486,6 +486,21 @@ type PortalSharedFileRecord = {
   uploadedBy?: string | null;
 };
 
+type PortalDeliverablePreviewType = "html" | "image" | "none";
+
+type PortalDeliverableRecord = {
+  id: string;
+  fileName: string;
+  relativePath: string;
+  runId: string;
+  sizeBytes: number;
+  mimeType: string;
+  createdAt: string;
+  updatedAt: string;
+  expiresAt: string;
+  previewType: PortalDeliverablePreviewType;
+};
+
 type ReleaseDescriptor = {
   releaseId?: string;
   releaseVersion?: string;
@@ -511,10 +526,14 @@ const PLATFORM_DEFAULT_FIND_SKILL_NAME = "find-base-skills";
 const PORTAL_SHARED_FILES_DIRNAME = "iqiyi_source";
 const PORTAL_SHARED_FILES_MANIFEST = ".portal-files.json";
 const PORTAL_SHARED_FILES_PROMPT_LIMIT = 20;
+const PORTAL_DELIVERABLES_DIRNAME = "iqiyi_deliverables";
+const PORTAL_DELIVERABLE_TTL_MS = 24 * 60 * 60 * 1000;
+const PORTAL_DELIVERABLE_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 
 const portalSessions = new Map<string, PortalSessionRecord>();
 const portalRuns = new Map<string, PortalRunRecord>();
 const portalRunAbortControllers = new Map<string, AbortController>();
+let portalDeliverablesCleanupTimer: ReturnType<typeof setInterval> | null = null;
 
 function abortTrackedPortalRun(runId: string): {
   aborted: boolean;
@@ -908,6 +927,7 @@ function buildPortalExtraSystemPrompt(params: {
   session: PortalSessionRecord;
   traceId?: string;
   portalSessionId?: string;
+  runId?: string;
   skillSearchPrefetch?: PortalSkillSearchPrefetch;
   sharedFiles?: PortalSharedFileRecord[];
 }): string {
@@ -970,6 +990,19 @@ function buildPortalExtraSystemPrompt(params: {
         `- ...and ${params.sharedFiles!.length - PORTAL_SHARED_FILES_PROMPT_LIMIT} more shared files under ${PORTAL_SHARED_FILES_DIRNAME}/`,
       );
     }
+  }
+  if (params.runId) {
+    const deliverablesSessionId =
+      params.portalSessionId ?? params.session.portalSessionId ?? params.remoteSessionId;
+    const deliverablesDir = `${PORTAL_DELIVERABLES_DIRNAME}/${normalizePortalDeliverablesSegment(deliverablesSessionId)}/${normalizePortalDeliverablesSegment(params.runId)}/`;
+    lines.push(
+      "",
+      "## Generated Deliverables",
+      `If you create files for the user to download, write them under ${deliverablesDir}`,
+      "Examples: HTML reports, charts, spreadsheets, slide decks, PDFs, archives, or generated documents.",
+      "Prefer self-contained HTML when producing charts or rich visual reports so the portal can preview them directly.",
+      "When you generate a downloadable file, mention it explicitly in your reply.",
+    );
   }
   if (params.session.conversationView === "training") {
     lines.push(
@@ -1498,6 +1531,338 @@ async function deletePortalSharedFile(
   const next = manifest.filter((item) => item.relativePath !== relativePath);
   await savePortalSharedFilesManifest(workspaceDir, next);
   return current;
+}
+
+function normalizePortalDeliverablesSegment(value: string | undefined | null): string {
+  const trimmed = (value ?? "").trim();
+  return trimmed.replace(/[^a-zA-Z0-9._-]+/g, "_") || "default";
+}
+
+function resolvePortalDeliverablesRoot(workspaceDir: string): string {
+  return path.join(workspaceDir, PORTAL_DELIVERABLES_DIRNAME);
+}
+
+function resolvePortalSessionDeliverablesRoot(
+  workspaceDir: string,
+  portalSessionId: string,
+): string {
+  return path.join(
+    resolvePortalDeliverablesRoot(workspaceDir),
+    normalizePortalDeliverablesSegment(portalSessionId),
+  );
+}
+
+function resolvePortalRunDeliverablesRoot(
+  workspaceDir: string,
+  portalSessionId: string,
+  runId: string,
+): string {
+  return path.join(
+    resolvePortalSessionDeliverablesRoot(workspaceDir, portalSessionId),
+    normalizePortalDeliverablesSegment(runId),
+  );
+}
+
+function normalizePortalDeliverableRelativePath(value: string): string | undefined {
+  const normalized = value.replaceAll("\\", "/").trim();
+  if (!normalized) {
+    return undefined;
+  }
+  const next = path.posix.normalize(normalized).replace(/^\/+/, "");
+  if (!next || next === "." || next.startsWith("../") || next.includes("/../")) {
+    return undefined;
+  }
+  return next;
+}
+
+function resolvePortalDeliverablePath(
+  workspaceDir: string,
+  portalSessionId: string,
+  artifactId: string,
+): string {
+  const sessionRoot = resolvePortalSessionDeliverablesRoot(workspaceDir, portalSessionId);
+  const relativePath = normalizePortalDeliverableRelativePath(artifactId);
+  if (!relativePath) {
+    throw new Error("missing or invalid deliverable id");
+  }
+  const target = path.join(sessionRoot, relativePath);
+  if (!isPathInside(sessionRoot, target)) {
+    throw new Error("deliverable path escapes iqiyi_deliverables root");
+  }
+  return target;
+}
+
+function inferPortalDeliverableMimeType(fileName: string): string {
+  const lower = fileName.toLowerCase();
+  if (lower.endsWith(".html") || lower.endsWith(".htm")) {
+    return "text/html; charset=utf-8";
+  }
+  if (lower.endsWith(".json")) {
+    return "application/json; charset=utf-8";
+  }
+  if (lower.endsWith(".md")) {
+    return "text/markdown; charset=utf-8";
+  }
+  if (lower.endsWith(".txt")) {
+    return "text/plain; charset=utf-8";
+  }
+  if (lower.endsWith(".csv")) {
+    return "text/csv; charset=utf-8";
+  }
+  if (lower.endsWith(".svg")) {
+    return "image/svg+xml";
+  }
+  if (lower.endsWith(".png")) {
+    return "image/png";
+  }
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
+    return "image/jpeg";
+  }
+  if (lower.endsWith(".gif")) {
+    return "image/gif";
+  }
+  if (lower.endsWith(".webp")) {
+    return "image/webp";
+  }
+  if (lower.endsWith(".pdf")) {
+    return "application/pdf";
+  }
+  if (lower.endsWith(".docx")) {
+    return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  }
+  if (lower.endsWith(".xlsx")) {
+    return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+  }
+  if (lower.endsWith(".pptx")) {
+    return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+  }
+  if (lower.endsWith(".zip")) {
+    return "application/zip";
+  }
+  return "application/octet-stream";
+}
+
+function inferPortalDeliverablePreviewType(fileName: string): PortalDeliverablePreviewType {
+  const lower = fileName.toLowerCase();
+  if (lower.endsWith(".html") || lower.endsWith(".htm")) {
+    return "html";
+  }
+  if (
+    lower.endsWith(".png") ||
+    lower.endsWith(".jpg") ||
+    lower.endsWith(".jpeg") ||
+    lower.endsWith(".gif") ||
+    lower.endsWith(".webp") ||
+    lower.endsWith(".svg")
+  ) {
+    return "image";
+  }
+  return "none";
+}
+
+async function collectFilesRecursively(rootDir: string, currentDir = rootDir): Promise<string[]> {
+  const entries = await fs.readdir(currentDir, { withFileTypes: true });
+  const files: string[] = [];
+  for (const entry of entries) {
+    const absolutePath = path.join(currentDir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...(await collectFilesRecursively(rootDir, absolutePath)));
+      continue;
+    }
+    if (!entry.isFile()) {
+      continue;
+    }
+    const relative = path.relative(rootDir, absolutePath).replaceAll(path.sep, "/");
+    const normalized = normalizePortalDeliverableRelativePath(relative);
+    if (normalized) {
+      files.push(normalized);
+    }
+  }
+  return files;
+}
+
+function buildPortalDeliverableRecord(params: {
+  relativePath: string;
+  stat: Awaited<ReturnType<typeof fs.stat>>;
+}): PortalDeliverableRecord {
+  const relativePath = params.relativePath.replaceAll("\\", "/");
+  const [runId = ""] = relativePath.split("/");
+  const fileName = path.posix.basename(relativePath);
+  const createdAt = params.stat.birthtime.toISOString();
+  const updatedAt = params.stat.mtime.toISOString();
+  const sizeBytes = Number(params.stat.size);
+  const updatedAtMs = Number(params.stat.mtimeMs);
+  return {
+    id: relativePath,
+    fileName,
+    relativePath,
+    runId,
+    sizeBytes,
+    mimeType: inferPortalDeliverableMimeType(fileName),
+    createdAt,
+    updatedAt,
+    expiresAt: new Date(updatedAtMs + PORTAL_DELIVERABLE_TTL_MS).toISOString(),
+    previewType: inferPortalDeliverablePreviewType(fileName),
+  };
+}
+
+function isPortalDeliverableExpired(stat: Awaited<ReturnType<typeof fs.stat>>): boolean {
+  return Number(stat.mtimeMs) + PORTAL_DELIVERABLE_TTL_MS <= Date.now();
+}
+
+async function pruneEmptyDirectory(targetDir: string, stopDir: string): Promise<void> {
+  let current = targetDir;
+  while (current === stopDir || isPathInside(stopDir, current)) {
+    const entries = await fs.readdir(current).catch(() => []);
+    if (entries.length > 0) {
+      return;
+    }
+    await fs.rm(current, { recursive: true, force: true }).catch(() => {});
+    if (current === stopDir) {
+      return;
+    }
+    current = path.dirname(current);
+  }
+}
+
+async function cleanupExpiredPortalDeliverablesForSession(
+  workspaceDir: string,
+  portalSessionId: string,
+): Promise<void> {
+  const sessionRoot = resolvePortalSessionDeliverablesRoot(workspaceDir, portalSessionId);
+  if (!(await pathExists(sessionRoot))) {
+    return;
+  }
+  const relativeFiles = await collectFilesRecursively(sessionRoot).catch(() => []);
+  for (const relativePath of relativeFiles) {
+    try {
+      const absolutePath = resolvePortalDeliverablePath(
+        workspaceDir,
+        portalSessionId,
+        relativePath,
+      );
+      const stat = await fs.stat(absolutePath);
+      if (!stat.isFile() || !isPortalDeliverableExpired(stat)) {
+        continue;
+      }
+      await fs.rm(absolutePath, { force: true });
+      await pruneEmptyDirectory(path.dirname(absolutePath), sessionRoot);
+    } catch {
+      // best effort cleanup
+    }
+  }
+}
+
+async function cleanupExpiredPortalDeliverablesInWorkspace(workspaceDir: string): Promise<void> {
+  const root = resolvePortalDeliverablesRoot(workspaceDir);
+  if (!(await pathExists(root))) {
+    return;
+  }
+  const sessions = await fs.readdir(root, { withFileTypes: true }).catch(() => []);
+  for (const entry of sessions) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    await cleanupExpiredPortalDeliverablesForSession(workspaceDir, entry.name);
+  }
+}
+
+async function cleanupExpiredPortalDeliverablesAcrossAgents(): Promise<void> {
+  const cfg = loadConfig();
+  for (const agentId of listAgentIds(cfg)) {
+    await cleanupExpiredPortalDeliverablesInWorkspace(resolveAgentWorkspaceDir(cfg, agentId));
+  }
+}
+
+function ensurePortalDeliverablesCleanupTimerStarted(): void {
+  if (portalDeliverablesCleanupTimer) {
+    return;
+  }
+  portalDeliverablesCleanupTimer = setInterval(() => {
+    void cleanupExpiredPortalDeliverablesAcrossAgents().catch(() => {});
+  }, PORTAL_DELIVERABLE_CLEANUP_INTERVAL_MS);
+  if (typeof portalDeliverablesCleanupTimer.unref === "function") {
+    portalDeliverablesCleanupTimer.unref();
+  }
+  void cleanupExpiredPortalDeliverablesAcrossAgents().catch(() => {});
+}
+
+async function listPortalDeliverablesForSession(
+  workspaceDir: string,
+  portalSessionId: string,
+): Promise<PortalDeliverableRecord[]> {
+  await cleanupExpiredPortalDeliverablesForSession(workspaceDir, portalSessionId);
+  const sessionRoot = resolvePortalSessionDeliverablesRoot(workspaceDir, portalSessionId);
+  if (!(await pathExists(sessionRoot))) {
+    return [];
+  }
+  const relativeFiles = await collectFilesRecursively(sessionRoot);
+  const records: PortalDeliverableRecord[] = [];
+  for (const relativePath of relativeFiles) {
+    const absolutePath = resolvePortalDeliverablePath(workspaceDir, portalSessionId, relativePath);
+    const stat = await fs.stat(absolutePath).catch(() => null);
+    if (!stat?.isFile()) {
+      continue;
+    }
+    records.push(
+      buildPortalDeliverableRecord({
+        relativePath,
+        stat,
+      }),
+    );
+  }
+  return records.toSorted((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+async function readPortalDeliverable(
+  workspaceDir: string,
+  portalSessionId: string,
+  artifactId: string,
+): Promise<{ record: PortalDeliverableRecord; content: Buffer }> {
+  await cleanupExpiredPortalDeliverablesForSession(workspaceDir, portalSessionId);
+  const targetPath = resolvePortalDeliverablePath(workspaceDir, portalSessionId, artifactId);
+  const stat = await fs.stat(targetPath);
+  if (!stat.isFile()) {
+    throw new Error("deliverable not found");
+  }
+  if (isPortalDeliverableExpired(stat)) {
+    await fs.rm(targetPath, { force: true }).catch(() => {});
+    throw new Error("deliverable expired");
+  }
+  const relativePath = normalizePortalDeliverableRelativePath(artifactId);
+  if (!relativePath) {
+    throw new Error("missing or invalid deliverable id");
+  }
+  return {
+    record: buildPortalDeliverableRecord({ relativePath, stat }),
+    content: await fs.readFile(targetPath),
+  };
+}
+
+async function deletePortalDeliverable(
+  workspaceDir: string,
+  portalSessionId: string,
+  artifactId: string,
+): Promise<PortalDeliverableRecord | null> {
+  const relativePath = normalizePortalDeliverableRelativePath(artifactId);
+  if (!relativePath) {
+    throw new Error("missing or invalid deliverable id");
+  }
+  const targetPath = resolvePortalDeliverablePath(workspaceDir, portalSessionId, relativePath);
+  const stat = await fs.stat(targetPath).catch(() => null);
+  const record =
+    stat?.isFile() === true
+      ? buildPortalDeliverableRecord({
+          relativePath,
+          stat,
+        })
+      : null;
+  await fs.rm(targetPath, { force: true });
+  await pruneEmptyDirectory(
+    path.dirname(targetPath),
+    resolvePortalSessionDeliverablesRoot(workspaceDir, portalSessionId),
+  );
+  return record;
 }
 
 async function copyFileIfMissing(sourcePath: string, targetPath: string): Promise<void> {
@@ -2074,6 +2439,7 @@ export async function handleControlPlaneHttpRequest(
     sendJson(res, 401, { error: "unauthorized bridge token" });
     return true;
   }
+  ensurePortalDeliverablesCleanupTimerStarted();
 
   if (url.pathname === `${PREFIX}/runtime-context`) {
     if (!ensureMethod(req, res, "GET")) {
@@ -2655,6 +3021,129 @@ export async function handleControlPlaneHttpRequest(
     return true;
   }
 
+  const portalDeliverablesMatch = url.pathname.match(
+    new RegExp(
+      `^${PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/portal/sessions/([^/]+)/deliverables$`,
+    ),
+  );
+  if (portalDeliverablesMatch) {
+    if (!ensureMethod(req, res, "GET")) {
+      return true;
+    }
+    const remoteSessionId = decodeURIComponent(portalDeliverablesMatch[1] ?? "");
+    const session = portalSessions.get(remoteSessionId);
+    if (!session) {
+      sendJson(res, 404, { ok: false, error: "session not found", remoteSessionId });
+      return true;
+    }
+    const cfg = loadConfig();
+    const workspaceDir = resolveAgentWorkspaceDir(cfg, session.agentId);
+    const portalSessionId = session.portalSessionId ?? remoteSessionId;
+    const deliverables = await listPortalDeliverablesForSession(workspaceDir, portalSessionId);
+    sendJson(res, 200, {
+      ok: true,
+      remoteSessionId,
+      portalSessionId,
+      deliverablesDir: `${PORTAL_DELIVERABLES_DIRNAME}/${normalizePortalDeliverablesSegment(portalSessionId)}`,
+      deliverables,
+    });
+    return true;
+  }
+
+  const portalDeliverableContentMatch = url.pathname.match(
+    new RegExp(
+      `^${PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/portal/sessions/([^/]+)/deliverables/(.+)/(download|preview)$`,
+    ),
+  );
+  if (portalDeliverableContentMatch) {
+    if (!ensureMethod(req, res, "GET")) {
+      return true;
+    }
+    const remoteSessionId = decodeURIComponent(portalDeliverableContentMatch[1] ?? "");
+    const artifactId = decodeURIComponent(portalDeliverableContentMatch[2] ?? "");
+    const action = portalDeliverableContentMatch[3] ?? "";
+    const session = portalSessions.get(remoteSessionId);
+    if (!session) {
+      sendJson(res, 404, { ok: false, error: "session not found", remoteSessionId });
+      return true;
+    }
+    const cfg = loadConfig();
+    const workspaceDir = resolveAgentWorkspaceDir(cfg, session.agentId);
+    const portalSessionId = session.portalSessionId ?? remoteSessionId;
+    try {
+      const deliverable = await readPortalDeliverable(workspaceDir, portalSessionId, artifactId);
+      if (action === "preview") {
+        if (deliverable.record.previewType !== "html") {
+          sendJson(res, 400, {
+            ok: false,
+            error: "deliverable preview only supports html files",
+            artifactId,
+          });
+          return true;
+        }
+        sendJson(res, 200, {
+          ok: true,
+          artifact: deliverable.record,
+          html: deliverable.content.toString("utf-8"),
+        });
+        return true;
+      }
+      sendJson(res, 200, {
+        ok: true,
+        artifact: deliverable.record,
+        fileName: deliverable.record.fileName,
+        mimeType: deliverable.record.mimeType,
+        contentBase64: deliverable.content.toString("base64"),
+      });
+    } catch (error) {
+      sendJson(res, 404, {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+        remoteSessionId,
+        artifactId,
+      });
+    }
+    return true;
+  }
+
+  const portalDeliverableDeleteMatch = url.pathname.match(
+    new RegExp(
+      `^${PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/portal/sessions/([^/]+)/deliverables/(.+)$`,
+    ),
+  );
+  if (portalDeliverableDeleteMatch) {
+    if (!ensureMethod(req, res, "DELETE")) {
+      return true;
+    }
+    const remoteSessionId = decodeURIComponent(portalDeliverableDeleteMatch[1] ?? "");
+    const artifactId = decodeURIComponent(portalDeliverableDeleteMatch[2] ?? "");
+    const session = portalSessions.get(remoteSessionId);
+    if (!session) {
+      sendJson(res, 404, { ok: false, error: "session not found", remoteSessionId });
+      return true;
+    }
+    const cfg = loadConfig();
+    const workspaceDir = resolveAgentWorkspaceDir(cfg, session.agentId);
+    const portalSessionId = session.portalSessionId ?? remoteSessionId;
+    try {
+      const deleted = await deletePortalDeliverable(workspaceDir, portalSessionId, artifactId);
+      sendJson(res, 200, {
+        ok: true,
+        remoteSessionId,
+        portalSessionId,
+        deleted,
+      });
+    } catch (error) {
+      sendJson(res, 400, {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+        remoteSessionId,
+        artifactId,
+      });
+    }
+    return true;
+  }
+
   const portalSessionStatusMatch = url.pathname.match(
     new RegExp(`^${PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/portal/sessions/([^/]+)$`),
   );
@@ -2920,9 +3409,21 @@ export async function handleControlPlaneHttpRequest(
       void (async () => {
         try {
           const cfg = loadConfig();
-          const sharedFiles = await listPortalSharedFiles(
-            resolveAgentWorkspaceDir(cfg, nextSession.agentId),
+          const workspaceDir = resolveAgentWorkspaceDir(cfg, nextSession.agentId);
+          const deliverablesPortalSessionId =
+            portalSessionId ?? nextSession.portalSessionId ?? remoteSessionId;
+          await cleanupExpiredPortalDeliverablesForSession(
+            workspaceDir,
+            deliverablesPortalSessionId,
           );
+          await fs.mkdir(
+            resolvePortalRunDeliverablesRoot(workspaceDir, deliverablesPortalSessionId, runId),
+            {
+              recursive: true,
+              mode: 0o700,
+            },
+          );
+          const sharedFiles = await listPortalSharedFiles(workspaceDir);
           const result = await agentCommandFromIngress(
             {
               message: effectiveMessage,
@@ -2941,6 +3442,7 @@ export async function handleControlPlaneHttpRequest(
                 session: nextSession,
                 traceId,
                 portalSessionId,
+                runId,
                 skillSearchPrefetch,
                 sharedFiles,
               }),
@@ -3223,9 +3725,18 @@ export async function handleControlPlaneHttpRequest(
     portalRunAbortControllers.set(runId, runAbortController);
     try {
       const cfg = loadConfig();
-      const sharedFiles = await listPortalSharedFiles(
-        resolveAgentWorkspaceDir(cfg, nextSession.agentId),
+      const workspaceDir = resolveAgentWorkspaceDir(cfg, nextSession.agentId);
+      const deliverablesPortalSessionId =
+        portalSessionId ?? nextSession.portalSessionId ?? remoteSessionId;
+      await cleanupExpiredPortalDeliverablesForSession(workspaceDir, deliverablesPortalSessionId);
+      await fs.mkdir(
+        resolvePortalRunDeliverablesRoot(workspaceDir, deliverablesPortalSessionId, runId),
+        {
+          recursive: true,
+          mode: 0o700,
+        },
       );
+      const sharedFiles = await listPortalSharedFiles(workspaceDir);
       const result = await agentCommandFromIngress(
         {
           message: effectiveMessage,
@@ -3244,6 +3755,7 @@ export async function handleControlPlaneHttpRequest(
             session: nextSession,
             traceId,
             portalSessionId,
+            runId,
             skillSearchPrefetch,
             sharedFiles,
           }),

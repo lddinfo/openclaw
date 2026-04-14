@@ -1019,7 +1019,7 @@ function buildPortalExtraSystemPrompt(params: {
       `If you create files for the user to download, write them under ${deliverablesDir}`,
       "Examples: HTML reports, charts, spreadsheets, slide decks, PDFs, archives, or generated documents.",
       "Prefer self-contained HTML when producing charts or rich visual reports so the portal can preview them directly.",
-      "When you generate a downloadable file, mention it explicitly in your reply.",
+      "When you generate a downloadable file, mention it explicitly in your reply and include the relative path or filename.",
     );
   }
   if (params.session.conversationView === "training") {
@@ -1853,15 +1853,57 @@ function buildPortalMessageAttachments(
   }));
 }
 
-async function listPortalMessageAttachmentsForRun(
-  workspaceDir: string,
-  portalSessionId: string,
-  runId: string,
-): Promise<PortalMessageAttachment[]> {
-  const deliverables = await listPortalDeliverablesForSession(workspaceDir, portalSessionId);
-  return buildPortalMessageAttachments(
-    deliverables.filter((deliverable) => deliverable.runId === runId),
+function collectPortalReplyReferencedDeliverables(params: {
+  deliverables: PortalDeliverableRecord[];
+  portalSessionId: string;
+  reply?: string;
+}): PortalDeliverableRecord[] {
+  const reply = params.reply?.trim();
+  if (!reply) {
+    return [];
+  }
+  const normalizedReply = reply.toLowerCase();
+  const basenameCounts = new Map<string, number>();
+  for (const deliverable of params.deliverables) {
+    const basename = deliverable.fileName.toLowerCase();
+    basenameCounts.set(basename, (basenameCounts.get(basename) ?? 0) + 1);
+  }
+  return params.deliverables.filter((deliverable) => {
+    const relativePath = deliverable.relativePath.toLowerCase();
+    const basename = deliverable.fileName.toLowerCase();
+    const fullRelativePath =
+      `${PORTAL_DELIVERABLES_DIRNAME}/${normalizePortalDeliverablesSegment(params.portalSessionId)}/${deliverable.relativePath}`.toLowerCase();
+    return (
+      normalizedReply.includes(fullRelativePath) ||
+      normalizedReply.includes(relativePath) ||
+      ((basenameCounts.get(basename) ?? 0) === 1 && normalizedReply.includes(basename))
+    );
+  });
+}
+
+async function resolvePortalMessageAttachments(params: {
+  workspaceDir: string;
+  portalSessionId: string;
+  runId: string;
+  reply?: string;
+}): Promise<PortalMessageAttachment[]> {
+  const deliverables = await listPortalDeliverablesForSession(
+    params.workspaceDir,
+    params.portalSessionId,
   );
+  const currentRunDeliverables = deliverables.filter(
+    (deliverable) => deliverable.runId === params.runId,
+  );
+  const referencedDeliverables = collectPortalReplyReferencedDeliverables({
+    deliverables,
+    portalSessionId: params.portalSessionId,
+    reply: params.reply,
+  });
+  const merged = new Map<string, PortalDeliverableRecord>();
+  for (const deliverable of [...currentRunDeliverables, ...referencedDeliverables]) {
+    merged.set(deliverable.id, deliverable);
+  }
+  return buildPortalMessageAttachments([...merged.values()]);
 }
 
 async function readPortalDeliverable(
@@ -3508,11 +3550,12 @@ export async function handleControlPlaneHttpRequest(
           );
           const reply = resolvePortalReplyText(result);
           const usage = extractPortalUsage(result);
-          const outputAttachments = await listPortalMessageAttachmentsForRun(
+          const outputAttachments = await resolvePortalMessageAttachments({
             workspaceDir,
-            deliverablesPortalSessionId,
+            portalSessionId: deliverablesPortalSessionId,
             runId,
-          );
+            reply,
+          });
           if (reply === EMPTY_PORTAL_REPLY) {
             defaultRuntime.log(
               `[control-plane] portal session produced no visible reply (runId=${runId}, traceId=${traceId}, remoteSessionId=${remoteSessionId}, agentId=${nextSession.agentId})`,
@@ -3830,11 +3873,12 @@ export async function handleControlPlaneHttpRequest(
       );
       const reply = resolvePortalReplyText(result);
       const usage = extractPortalUsage(result);
-      const outputAttachments = await listPortalMessageAttachmentsForRun(
+      const outputAttachments = await resolvePortalMessageAttachments({
         workspaceDir,
-        deliverablesPortalSessionId,
+        portalSessionId: deliverablesPortalSessionId,
         runId,
-      );
+        reply,
+      });
       if (reply === EMPTY_PORTAL_REPLY) {
         defaultRuntime.log(
           `[control-plane] portal session produced no visible reply (runId=${runId}, traceId=${traceId}, remoteSessionId=${remoteSessionId}, agentId=${nextSession.agentId})`,
@@ -4234,11 +4278,12 @@ export async function handleControlPlaneHttpRequest(
             const cfg = loadConfig();
             const workspaceDir = resolveAgentWorkspaceDir(cfg, session.agentId);
             const deliverablesPortalSessionId = session.portalSessionId ?? remoteSessionId;
-            outputAttachments = await listPortalMessageAttachmentsForRun(
+            outputAttachments = await resolvePortalMessageAttachments({
               workspaceDir,
-              deliverablesPortalSessionId,
-              lastRunId,
-            );
+              portalSessionId: deliverablesPortalSessionId,
+              runId: lastRunId,
+              reply: combinedReply,
+            });
             if (currentRun) {
               currentRun = savePortalRun({
                 ...currentRun,

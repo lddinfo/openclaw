@@ -36,6 +36,7 @@ import {
 import {
   loadControlPlaneRuntimeState,
   mergeControlPlaneRuntimeState,
+  saveControlPlaneRuntimeState,
 } from "./control-plane-runtime.js";
 import type {
   ControlPlaneConversationView,
@@ -2782,6 +2783,211 @@ export async function handleControlPlaneHttpRequest(
       sendJson(res, 400, {
         error: error instanceof Error ? error.message : String(error),
       });
+    }
+    return true;
+  }
+
+  // ==================== Workspace Archive Export ====================
+  const workspaceArchiveMatch = url.pathname.match(
+    new RegExp(
+      `^${PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/agents/([^/]+)/workspace/archive$`,
+    ),
+  );
+  if (workspaceArchiveMatch) {
+    if (!ensureMethod(req, res, "GET")) {
+      return true;
+    }
+    const remoteAgentId = workspaceArchiveMatch[1] ?? "";
+    const current = loadControlPlaneRuntimeState();
+    const runtimeAgent = (current.agents ?? []).find(
+      (entry) =>
+        normalizeRemoteAgentId(entry.remoteAgentId) === normalizeRemoteAgentId(remoteAgentId),
+    );
+    if (!runtimeAgent) {
+      sendJson(res, 404, { error: "agent not found", remoteAgentId });
+      return true;
+    }
+    try {
+      const cfg = loadConfig();
+      const workspaceDir = resolveAgentWorkspaceDir(cfg, runtimeAgent.agentId);
+      try {
+        await fs.access(workspaceDir);
+      } catch {
+        sendJson(res, 404, { error: "workspace directory does not exist", remoteAgentId });
+        return true;
+      }
+      const archiveFiles: Array<{ relativePath: string; contentBase64: string }> = [];
+      let fileCount = 0;
+      let totalSize = 0;
+
+      async function collectFiles(dir: string, prefix: string) {
+        let entries: import("node:fs").Dirent[];
+        try {
+          entries = await fs.readdir(dir, { withFileTypes: true });
+        } catch {
+          return;
+        }
+        for (const entry of entries) {
+          const fullPath = path.join(dir, entry.name);
+          const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+          if (entry.name === ".git" || entry.name === "node_modules") {
+            continue;
+          }
+          if (entry.isDirectory()) {
+            await collectFiles(fullPath, relPath);
+          } else if (entry.isFile()) {
+            try {
+              const content = await fs.readFile(fullPath);
+              archiveFiles.push({
+                relativePath: relPath,
+                contentBase64: content.toString("base64"),
+              });
+              fileCount++;
+              totalSize += content.length;
+            } catch {
+              // skip unreadable files
+            }
+          }
+        }
+      }
+
+      await collectFiles(workspaceDir, "");
+      sendJson(res, 200, {
+        ok: true,
+        agentId: runtimeAgent.agentId,
+        remoteAgentId: runtimeAgent.remoteAgentId,
+        workspaceDir,
+        fileCount,
+        archiveSizeBytes: totalSize,
+        archiveBase64: Buffer.from(JSON.stringify(archiveFiles)).toString("base64"),
+      });
+    } catch (error) {
+      sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    }
+    return true;
+  }
+
+  // ==================== Workspace Archive Import ====================
+  if (url.pathname === `${PREFIX}/agents/import-archive`) {
+    if (!ensureMethod(req, res, "POST")) {
+      return true;
+    }
+    const body = await readBody(req);
+    try {
+      const requestedAgentId = normalizeAgentId(
+        readOptionalString(body, "agentId", "localAgentKey") || "",
+      );
+      if (!requestedAgentId) {
+        sendJson(res, 400, { error: "agentId is required" });
+        return true;
+      }
+      const archiveBase64 = readOptionalString(body, "archiveBase64") || "";
+      if (!archiveBase64) {
+        sendJson(res, 400, { error: "archiveBase64 is required" });
+        return true;
+      }
+
+      const cfg = loadConfig();
+      const workspaceDir = resolveAgentWorkspaceDir(cfg, requestedAgentId);
+      const agentDir = resolveAgentDir(cfg, requestedAgentId);
+
+      const agentsList = cfg.agents?.list ?? [];
+      const existingEntry = agentsList.find(
+        (entry) => normalizeAgentId(entry.id || "") === requestedAgentId,
+      );
+      if (!existingEntry) {
+        const updatedList = [
+          ...agentsList,
+          { id: requestedAgentId, workspace: workspaceDir, agentDir },
+        ];
+        await writeConfigFile({ ...cfg, agents: { ...cfg.agents, list: updatedList } });
+      }
+
+      await fs.mkdir(workspaceDir, { recursive: true });
+
+      let archiveFiles: Array<{ relativePath: string; contentBase64: string }>;
+      try {
+        archiveFiles = JSON.parse(Buffer.from(archiveBase64, "base64").toString("utf-8"));
+      } catch {
+        sendJson(res, 400, { error: "invalid archiveBase64 format" });
+        return true;
+      }
+
+      let restoredCount = 0;
+      for (const file of archiveFiles) {
+        if (!file.relativePath || typeof file.contentBase64 !== "string") {
+          continue;
+        }
+        const normalized = file.relativePath.replace(/\.\./g, "").replace(/^\//, "");
+        if (!normalized) {
+          continue;
+        }
+        const targetPath = path.join(workspaceDir, normalized);
+        if (!isPathInside(targetPath, workspaceDir)) {
+          continue;
+        }
+        await fs.mkdir(path.dirname(targetPath), { recursive: true });
+        await fs.writeFile(targetPath, Buffer.from(file.contentBase64, "base64"));
+        restoredCount++;
+      }
+
+      const reloadedCfg = loadConfig();
+      await ensureAgentWorkspace({
+        dir: resolveAgentWorkspaceDir(reloadedCfg, requestedAgentId),
+        ensureBootstrapFiles: true,
+      });
+
+      const defaultAgentId = resolveDefaultAgentId(reloadedCfg);
+      if (requestedAgentId !== defaultAgentId) {
+        const defaultAgentDir = resolveAgentDir(reloadedCfg, defaultAgentId);
+        for (const seedFile of ["auth-profiles.json", "models.json"]) {
+          const src = path.join(defaultAgentDir, seedFile);
+          const dst = path.join(agentDir, seedFile);
+          try {
+            await fs.access(dst);
+          } catch {
+            try {
+              await fs.mkdir(path.dirname(dst), { recursive: true });
+              await fs.copyFile(src, dst);
+            } catch {
+              // skip if source doesn't exist
+            }
+          }
+        }
+      }
+
+      const remoteAgentId = requestedAgentId;
+      const state = loadControlPlaneRuntimeState();
+      const existingAgent = (state.agents ?? []).find(
+        (a) => normalizeAgentId(a.agentId) === requestedAgentId,
+      );
+      if (!existingAgent) {
+        const updatedAt = new Date().toISOString();
+        state.agents = [
+          ...(state.agents ?? []),
+          {
+            agentId: requestedAgentId,
+            remoteAgentId,
+            localAgentKey: requestedAgentId,
+            workspaceKey: requestedAgentId,
+            runtimeRole: "serving",
+            status: "imported",
+            updatedAt,
+          } satisfies ControlPlaneRuntimeAgent,
+        ];
+        saveControlPlaneRuntimeState(state);
+      }
+
+      sendJson(res, 200, {
+        ok: true,
+        agentId: requestedAgentId,
+        remoteAgentId,
+        localAgentKey: requestedAgentId,
+        workspaceKey: requestedAgentId,
+        restoredFileCount: restoredCount,
+      });
+    } catch (error) {
+      sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
     }
     return true;
   }

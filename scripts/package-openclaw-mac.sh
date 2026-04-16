@@ -7,8 +7,6 @@ set -euo pipefail
 # upstream openclaw@latest.
 
 OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
-# Runtime JSON profile files bundled into the archive (override for your machine).
-OPENCLAW_MAC_PROFILE_SOURCE="${OPENCLAW_MAC_PROFILE_SOURCE:-/Users/lidongdong/Desktop/openclaw}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ARTIFACTS_ROOT="${OPENCLAW_MAC_BUNDLE_OUTPUT_DIR:-${REPO_ROOT}/.artifacts/openclaw-mac-bundles}"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
@@ -21,9 +19,10 @@ LOCAL_PACKAGE_PATH=""
 BUNDLE_ENV_PATH="${OUT_DIR}/.openclaw/.env"
 SOURCE_HOME_FOR_REWRITE="${HOME}"
 SOURCE_OPENCLAW_HOME="${OPENCLAW_HOME}"
+SOURCE_PROFILE_ROOT_FOR_REWRITE="${OPENCLAW_HOME}"
 
 echo "Packing OpenClaw runtime profile from: ${OPENCLAW_HOME}"
-echo "Bundling config JSON from: ${OPENCLAW_MAC_PROFILE_SOURCE}"
+echo "Bundling config JSON from: ${OPENCLAW_HOME}"
 echo "Using local repository: ${REPO_ROOT}"
 echo "Writing bundle artifacts to: ${ARTIFACTS_ROOT}"
 
@@ -217,8 +216,8 @@ fi
 
 echo "  [package] ${LOCAL_PACKAGE_PATH}"
 
-copy_if_exists "${OPENCLAW_MAC_PROFILE_SOURCE}/openclaw.json" "${OUT_DIR}/.openclaw/openclaw.json"
-copy_if_exists "${OPENCLAW_MAC_PROFILE_SOURCE}/exec-approvals.json" "${OUT_DIR}/.openclaw/exec-approvals.json"
+copy_if_exists "${OPENCLAW_HOME}/openclaw.json" "${OUT_DIR}/.openclaw/openclaw.json"
+copy_if_exists "${OPENCLAW_HOME}/exec-approvals.json" "${OUT_DIR}/.openclaw/exec-approvals.json"
 copy_if_exists "${OPENCLAW_HOME}/workspace/SOUL.md" "${OUT_DIR}/.openclaw/workspace/SOUL.md"
 create_bundle_env "${BUNDLE_ENV_PATH}"
 
@@ -264,9 +263,9 @@ To import on a target Mac:
    - installs THIS local OpenClaw build globally
    - prompts before overwriting existing ~/.openclaw/.env, ~/.openclaw/openclaw.json, and ~/.openclaw/exec-approvals.json
    - when replacing ~/.openclaw/.env, substitutes \$HOME/.openclaw in place of __OPENCLAW_HOME__
-   - when replacing ~/.openclaw/openclaw.json, preserves the target Mac's existing agents.list
-   - when replacing ~/.openclaw/openclaw.json, rewrites source-machine /Users/... paths to the target \$HOME
-   - copies SOUL.md
+  - when replacing ~/.openclaw/openclaw.json, preserves the target Mac's existing agents.list
+  - when replacing ~/.openclaw/openclaw.json, rewrites source-machine /Users/... paths to the target \$HOME
+  - copies SOUL.md
    - preserves the target Mac's existing ~/.openclaw/control-plane-state.json
 
 5. Choose how you want to run the Gateway:
@@ -468,8 +467,9 @@ if missing:
 PY
 
 if [ -f "\${BUNDLE_DIR}/.openclaw/openclaw.json" ] && prompt_overwrite_file "\$HOME/.openclaw/openclaw.json" "~/.openclaw/openclaw.json"; then
-  python3 - "\${BUNDLE_DIR}/.openclaw/openclaw.json" "\$HOME/.openclaw/openclaw.json" "\$HOME" "${SOURCE_OPENCLAW_HOME}" "${SOURCE_HOME_FOR_REWRITE}" <<'PY'
+  python3 - "\${BUNDLE_DIR}/.openclaw/openclaw.json" "\$HOME/.openclaw/openclaw.json" "\$HOME" "${SOURCE_OPENCLAW_HOME}" "${SOURCE_HOME_FOR_REWRITE}" "${SOURCE_PROFILE_ROOT_FOR_REWRITE}" <<'PY'
 import json
+import os
 import pathlib
 import sys
 
@@ -478,16 +478,76 @@ target_path = pathlib.Path(sys.argv[2])
 target_home = sys.argv[3]
 source_openclaw_home = sys.argv[4]
 source_home = sys.argv[5]
+source_profile_root = sys.argv[6]
 target_openclaw_home = str(pathlib.Path(target_home) / ".openclaw")
+target_workspace_root = str(pathlib.Path(target_openclaw_home) / "workspace")
+target_agents_root = str(pathlib.Path(target_openclaw_home) / "agents")
+
+def normalize_root(value):
+    if not value:
+        return None
+    normalized = os.path.normpath(value)
+    return normalized.rstrip("/") if normalized != "/" else normalized
+
+def existing_root_variants(value):
+    normalized = normalize_root(value)
+    if not normalized:
+        return []
+    variants = []
+    for candidate in [normalized, os.path.realpath(normalized)]:
+        candidate = normalize_root(candidate)
+        if candidate and candidate not in variants:
+            variants.append(candidate)
+    return variants
+
+def build_prefix_rewrites():
+    rewrite_specs = [
+        (os.path.join(source_openclaw_home, "workspace"), target_workspace_root),
+        (os.path.join(source_openclaw_home, "agents"), target_agents_root),
+        (source_openclaw_home, target_openclaw_home),
+        (os.path.join(source_profile_root, ".openclaw", "workspace"), target_workspace_root),
+        (os.path.join(source_profile_root, ".openclaw", "agents"), target_agents_root),
+        (os.path.join(source_profile_root, ".openclaw"), target_openclaw_home),
+        (os.path.join(source_profile_root, "workspace"), target_workspace_root),
+        (os.path.join(source_profile_root, "agents"), target_agents_root),
+        (source_home, target_home),
+    ]
+    rewrites = []
+    seen = set()
+    for raw_source, raw_target in rewrite_specs:
+        target = normalize_root(raw_target)
+        if not target:
+            continue
+        for source in existing_root_variants(raw_source):
+            key = (source, target)
+            if key in seen:
+                continue
+            seen.add(key)
+            rewrites.append(key)
+    rewrites.sort(key=lambda item: len(item[0]), reverse=True)
+    return rewrites
+
+PREFIX_REWRITES = build_prefix_rewrites()
+
+def rewrite_path_prefix(value):
+    normalized_value = normalize_root(value)
+    if not normalized_value or not os.path.isabs(normalized_value):
+        return None
+    for source, target in PREFIX_REWRITES:
+        if normalized_value == source:
+            return target
+        prefix = f"{source}/"
+        if normalized_value.startswith(prefix):
+            suffix = normalized_value[len(prefix):]
+            return os.path.join(target, suffix) if suffix else target
+    return None
 
 def rewrite_value(value):
     if isinstance(value, str):
-        out = value
-        if source_openclaw_home:
-            out = out.replace(source_openclaw_home, target_openclaw_home)
-        if source_home:
-            out = out.replace(source_home, target_home)
-        return out
+        rewritten_path = rewrite_path_prefix(value)
+        if rewritten_path is not None:
+            return rewritten_path
+        return value
     if isinstance(value, list):
         return [rewrite_value(item) for item in value]
     if isinstance(value, dict):
@@ -534,18 +594,114 @@ if [ -f "\${BUNDLE_DIR}/.openclaw/.env" ] && prompt_overwrite_file "\$HOME/.open
   EXISTING_ENV_PATH="\$HOME/.openclaw/.env"
   TMP_ENV_PATH="\$HOME/.openclaw/.env.tmp.\$\$"
   printf '%s\n' "\${BUNDLE_ENV_CONTENT}" > "\${TMP_ENV_PATH}"
-  python3 - "\${TMP_ENV_PATH}" "\${EXISTING_ENV_PATH}" <<'PY'
+  python3 - "\${TMP_ENV_PATH}" "\${EXISTING_ENV_PATH}" "\$HOME" "${SOURCE_OPENCLAW_HOME}" "${SOURCE_HOME_FOR_REWRITE}" "${SOURCE_PROFILE_ROOT_FOR_REWRITE}" <<'PY'
+import os
 import pathlib
 import re
 import sys
 
 bundle_path = pathlib.Path(sys.argv[1])
 existing_path = pathlib.Path(sys.argv[2])
+target_home = sys.argv[3]
+source_openclaw_home = sys.argv[4]
+source_home = sys.argv[5]
+source_profile_root = sys.argv[6]
+target_openclaw_home = str(pathlib.Path(target_home) / ".openclaw")
+target_workspace_root = str(pathlib.Path(target_openclaw_home) / "workspace")
+target_agents_root = str(pathlib.Path(target_openclaw_home) / "agents")
 preserve_keys = [
     "AGENT_BOT_API_BASE_URL",
     "CONTROL_PLANE_BASE_URL",
     "AGENT_BOT_BASE_URL",
 ]
+
+def normalize_root(value):
+    if not value:
+        return None
+    normalized = os.path.normpath(value)
+    return normalized.rstrip("/") if normalized != "/" else normalized
+
+def existing_root_variants(value):
+    normalized = normalize_root(value)
+    if not normalized:
+        return []
+    variants = []
+    for candidate in [normalized, os.path.realpath(normalized)]:
+        candidate = normalize_root(candidate)
+        if candidate and candidate not in variants:
+            variants.append(candidate)
+    return variants
+
+def build_prefix_rewrites():
+    rewrite_specs = [
+        (os.path.join(source_openclaw_home, "workspace"), target_workspace_root),
+        (os.path.join(source_openclaw_home, "agents"), target_agents_root),
+        (source_openclaw_home, target_openclaw_home),
+        (os.path.join(source_profile_root, ".openclaw", "workspace"), target_workspace_root),
+        (os.path.join(source_profile_root, ".openclaw", "agents"), target_agents_root),
+        (os.path.join(source_profile_root, ".openclaw"), target_openclaw_home),
+        (os.path.join(source_profile_root, "workspace"), target_workspace_root),
+        (os.path.join(source_profile_root, "agents"), target_agents_root),
+        (source_home, target_home),
+    ]
+    rewrites = []
+    seen = set()
+    for raw_source, raw_target in rewrite_specs:
+        target = normalize_root(raw_target)
+        if not target:
+            continue
+        for source in existing_root_variants(raw_source):
+            key = (source, target)
+            if key in seen:
+                continue
+            seen.add(key)
+            rewrites.append(key)
+    rewrites.sort(key=lambda item: len(item[0]), reverse=True)
+    return rewrites
+
+PREFIX_REWRITES = build_prefix_rewrites()
+
+def rewrite_path_prefix(value):
+    normalized_value = normalize_root(value)
+    if not normalized_value or not os.path.isabs(normalized_value):
+        return None
+    for source, target in PREFIX_REWRITES:
+        if normalized_value == source:
+            return target
+        prefix = f"{source}/"
+        if normalized_value.startswith(prefix):
+            suffix = normalized_value[len(prefix):]
+            return os.path.join(target, suffix) if suffix else target
+    return None
+
+def maybe_rewrite_env_value(value):
+    stripped = value.strip()
+    quote = ""
+    inner = stripped
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {"'", '"'}:
+        quote = stripped[0]
+        inner = stripped[1:-1]
+
+    rewritten = rewrite_path_prefix(inner)
+    if rewritten is None and ":" in inner and not re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", inner):
+        parts = inner.split(":")
+        changed = False
+        rewritten_parts = []
+        for part in parts:
+            rewritten_part = rewrite_path_prefix(part)
+            if rewritten_part is not None:
+                rewritten_parts.append(rewritten_part)
+                changed = True
+            else:
+                rewritten_parts.append(part)
+        if changed:
+            rewritten = ":".join(rewritten_parts)
+
+    if rewritten is None:
+        return value
+    if quote:
+        return f"{quote}{rewritten}{quote}"
+    return rewritten
 
 def parse_env(path):
     result = {}
@@ -572,7 +728,15 @@ for key in preserve_keys:
         ]
         merged_lines.append(f"{key}={value}")
 
-bundle_path.write_text("\n".join(merged_lines).rstrip("\n") + "\n", encoding="utf-8")
+rewritten_lines = []
+for line in merged_lines:
+    match = re.match(r'^([ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*=[ \t]*)(.*)$', line)
+    if not match:
+        rewritten_lines.append(line)
+        continue
+    rewritten_lines.append(f"{match.group(1)}{maybe_rewrite_env_value(match.group(2))}")
+
+bundle_path.write_text("\n".join(rewritten_lines).rstrip("\n") + "\n", encoding="utf-8")
 PY
   mv "\${TMP_ENV_PATH}" "\${EXISTING_ENV_PATH}"
 fi

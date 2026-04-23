@@ -1,4 +1,4 @@
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { loadControlPlaneRuntimeState } from "../../gateway/control-plane-runtime.js";
 import { installSkillPackageFromRegistryDownload } from "../../gateway/control-plane-skill-install.js";
 import {

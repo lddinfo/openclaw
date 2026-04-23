@@ -1,9 +1,9 @@
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import {
+  asToolParamsRecord,
   jsonResult,
   readNumberParam,
   readStringParam,
-  type AnyAgentTool,
   type OpenClawConfig,
 } from "openclaw/plugin-sdk/memory-core-host-runtime-core";
 import type {
@@ -189,7 +189,7 @@ export function createMemorySearchTool(options: {
   config?: OpenClawConfig;
   agentSessionKey?: string;
   portalContext?: AgentPortalContext;
-}): AnyAgentTool | null {
+}) {
   return createMemoryTool({
     options,
     label: "Memory Search",
@@ -200,10 +200,11 @@ export function createMemorySearchTool(options: {
     execute:
       ({ cfg, agentId }) =>
       async (_toolCallId, params) => {
-        const query = readStringParam(params, "query", { required: true });
-        const maxResults = readNumberParam(params, "maxResults");
-        const minScore = readNumberParam(params, "minScore");
-        const requestedCorpus = readStringParam(params, "corpus") as
+        const rawParams = asToolParamsRecord(params);
+        const query = readStringParam(rawParams, "query", { required: true });
+        const maxResults = readNumberParam(rawParams, "maxResults");
+        const minScore = readNumberParam(rawParams, "minScore");
+        const requestedCorpus = readStringParam(rawParams, "corpus") as
           | "memory"
           | "wiki"
           | "all"
@@ -229,7 +230,9 @@ export function createMemorySearchTool(options: {
           });
           const searchStartedAt = Date.now();
           let rawResults: MemorySearchResult[] = [];
-          let surfacedMemoryResults: Array<MemorySearchResult & { corpus: "memory" }> = [];
+          let surfacedMemoryResults: Array<
+            Record<string, unknown> & { corpus: "memory"; score: number; path: string }
+          > = [];
           let provider: string | undefined;
           let model: string | undefined;
           let fallback: unknown;
@@ -264,7 +267,6 @@ export function createMemorySearchTool(options: {
             const resolved = resolveMemoryBackendConfig({
               cfg,
               agentId,
-              portalContext: options.portalContext,
             });
             const memoryResults =
               status.backend === "qmd"
@@ -340,21 +342,22 @@ export function createMemoryGetTool(options: {
   config?: OpenClawConfig;
   agentSessionKey?: string;
   portalContext?: AgentPortalContext;
-}): AnyAgentTool | null {
+}) {
   return createMemoryTool({
     options,
     label: "Memory Get",
     name: "memory_get",
     description:
-      "Safe snippet read from MEMORY.md or memory/*.md with optional from/lines; `corpus=wiki` reads from registered compiled-wiki supplements. Use after search to pull only the needed lines and keep context small.",
+      "Safe exact excerpt read from MEMORY.md or memory/*.md. Defaults to a bounded excerpt when lines are omitted, includes truncation/continuation info when more content exists, and `corpus=wiki` reads from registered compiled-wiki supplements.",
     parameters: MemoryGetSchema,
     execute:
       ({ cfg, agentId }) =>
       async (_toolCallId, params) => {
-        const relPath = readStringParam(params, "path", { required: true });
-        const from = readNumberParam(params, "from", { integer: true });
-        const lines = readNumberParam(params, "lines", { integer: true });
-        const requestedCorpus = readStringParam(params, "corpus") as
+        const rawParams = asToolParamsRecord(params);
+        const relPath = readStringParam(rawParams, "path", { required: true });
+        const from = readNumberParam(rawParams, "from", { integer: true });
+        const lines = readNumberParam(rawParams, "lines", { integer: true });
+        const requestedCorpus = readStringParam(rawParams, "corpus") as
           | "memory"
           | "wiki"
           | "all"
@@ -381,7 +384,6 @@ export function createMemoryGetTool(options: {
         const resolved = resolveMemoryBackendConfig({
           cfg,
           agentId,
-          portalContext: options.portalContext,
         });
         if (resolved.backend === "builtin") {
           return await executeMemoryReadResult({

@@ -341,6 +341,9 @@ prompt_overwrite_file() {
 }
 
 mkdir -p "\$HOME/.openclaw/workspace"
+# Target-machine bundle installs should restore staged bundled-plugin runtime
+# dependencies automatically instead of requiring a manual env var.
+export OPENCLAW_EAGER_BUNDLED_PLUGIN_DEPS="\${OPENCLAW_EAGER_BUNDLED_PLUGIN_DEPS:-1}"
 npm install -g "\${BUNDLE_DIR}/packages/\${PACKAGE_NAME}"
 
 GLOBAL_NPM_ROOT="\$(npm root -g)"

@@ -1,4 +1,3 @@
-import { Type } from "@sinclair/typebox";
 import {
   listMemoryCorpusSupplements,
   resolveMemorySearchConfig,
@@ -9,6 +8,7 @@ import {
   type OpenClawConfig,
 } from "openclaw/plugin-sdk/memory-core-host-runtime-core";
 import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/text-runtime";
+import { Type } from "typebox";
 import type { AgentPortalContext } from "../../../src/agents/command/types.js";
 
 type MemoryToolRuntime = typeof import("./tools.runtime.js");
@@ -139,6 +139,11 @@ export function buildMemorySearchUnavailableResult(error: string | undefined) {
     error: reason,
     warning,
     action,
+    debug: {
+      warning,
+      action,
+      error: reason,
+    },
   };
 }
 

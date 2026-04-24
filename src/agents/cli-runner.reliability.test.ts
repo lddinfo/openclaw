@@ -1,4 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  __testing as replyRunTesting,
+  createReplyOperation,
+  replyRunRegistry,
+} from "../auto-reply/reply/reply-run-registry.js";
 import { runPreparedCliAgent } from "./cli-runner.js";
 import {
   createManagedRun,
@@ -33,6 +38,7 @@ function buildPreparedContext(params?: {
       prompt: "hi",
       provider: "codex-cli",
       model: "gpt-5.4",
+      thinkLevel: "low",
       timeoutMs: 1_000,
       runId: params?.runId ?? "run-2",
     },
@@ -54,10 +60,15 @@ function buildPreparedContext(params?: {
     systemPrompt: "You are a helpful assistant.",
     systemPromptReport: {} as PreparedCliRunContext["systemPromptReport"],
     bootstrapPromptWarningLines: [],
+    authEpochVersion: 2,
   };
 }
 
 describe("runCliAgent reliability", () => {
+  afterEach(() => {
+    replyRunTesting.resetReplyRunRegistry();
+  });
+
   it("fails with timeout when no-output watchdog trips", async () => {
     supervisorSpawnMock.mockResolvedValueOnce(
       createManagedRun({
@@ -176,6 +187,130 @@ describe("runCliAgent reliability", () => {
     ).rejects.toThrow("rate limit exceeded");
 
     expect(supervisorSpawnMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns the assembled CLI prompt in meta for raw trace consumers", async () => {
+    supervisorSpawnMock.mockResolvedValueOnce(
+      createManagedRun({
+        reason: "exit",
+        exitCode: 0,
+        exitSignal: null,
+        durationMs: 50,
+        stdout: "hello from cli",
+        stderr: "",
+        timedOut: false,
+        noOutputTimedOut: false,
+      }),
+    );
+
+    const result = await runPreparedCliAgent({
+      ...buildPreparedContext(),
+      bootstrapPromptWarningLines: ["Warning: prompt budget low."],
+    });
+
+    expect(result.meta.finalPromptText).toContain("Warning: prompt budget low.");
+    expect(result.meta.finalPromptText).toContain("hi");
+    expect(result.meta.finalAssistantRawText).toBe("hello from cli");
+    expect(result.meta.executionTrace).toMatchObject({
+      winnerProvider: "codex-cli",
+      winnerModel: "gpt-5.4",
+      fallbackUsed: false,
+      runner: "cli",
+      attempts: [{ provider: "codex-cli", model: "gpt-5.4", result: "success" }],
+    });
+    expect(result.meta.requestShaping).toMatchObject({
+      thinking: "low",
+    });
+    expect(result.meta.completion).toMatchObject({
+      finishReason: "stop",
+      stopReason: "completed",
+      refusal: false,
+    });
+  });
+
+  it("reports CLI reply backends as streaming until the managed run finishes", async () => {
+    const operation = createReplyOperation({
+      sessionKey: "agent:main:main",
+      sessionId: "s1",
+      resetTriggered: false,
+    });
+    operation.setPhase("running");
+    let finishRun: (() => void) | undefined;
+    const waitForExit = new Promise<
+      Awaited<ReturnType<ReturnType<typeof createManagedRun>["wait"]>>
+    >((resolve) => {
+      finishRun = () => {
+        resolve({
+          reason: "exit",
+          exitCode: 0,
+          exitSignal: null,
+          durationMs: 50,
+          stdout: "hello from cli",
+          stderr: "",
+          timedOut: false,
+          noOutputTimedOut: false,
+        });
+      };
+    });
+    supervisorSpawnMock.mockResolvedValueOnce({
+      ...createManagedRun({
+        reason: "exit",
+        exitCode: 0,
+        exitSignal: null,
+        durationMs: 50,
+        stdout: "unused",
+        stderr: "",
+        timedOut: false,
+        noOutputTimedOut: false,
+      }),
+      wait: vi.fn(() => waitForExit),
+    });
+
+    const run = executePreparedCliRun({
+      ...buildPreparedContext({ sessionKey: "agent:main:main" }),
+      params: {
+        ...buildPreparedContext({ sessionKey: "agent:main:main" }).params,
+        replyOperation: operation,
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(replyRunRegistry.isStreaming("agent:main:main")).toBe(true);
+    });
+
+    finishRun?.();
+    await expect(run).resolves.toMatchObject({ text: "hello from cli" });
+    expect(replyRunRegistry.isStreaming("agent:main:main")).toBe(false);
+    operation.complete();
+  });
+
+  it("keeps raw assistant output separate from transformed visible CLI output", async () => {
+    supervisorSpawnMock.mockResolvedValueOnce(
+      createManagedRun({
+        reason: "exit",
+        exitCode: 0,
+        exitSignal: null,
+        durationMs: 50,
+        stdout: "hello from cli",
+        stderr: "",
+        timedOut: false,
+        noOutputTimedOut: false,
+      }),
+    );
+
+    const result = await runPreparedCliAgent({
+      ...buildPreparedContext(),
+      backendResolved: {
+        ...buildPreparedContext().backendResolved,
+        textTransforms: {
+          output: [{ from: "hello", to: "goodbye" }],
+        },
+      },
+    });
+
+    expect(result.payloads).toEqual([{ text: "goodbye from cli" }]);
+    expect(result.meta.finalAssistantVisibleText).toBe("goodbye from cli");
+    expect(result.meta.finalAssistantRawText).toBe("hello from cli");
   });
 });
 

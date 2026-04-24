@@ -39,8 +39,11 @@ export type GatewaySessionRow = {
   systemSent?: boolean;
   abortedLastRun?: boolean;
   thinkingLevel?: string;
+  thinkingOptions?: string[];
+  thinkingDefault?: string;
   fastMode?: boolean;
   verboseLevel?: string;
+  traceLevel?: string;
   reasoningLevel?: string;
   elevatedLevel?: string;
   sendPolicy?: "allow" | "deny";

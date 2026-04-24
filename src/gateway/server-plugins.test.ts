@@ -88,6 +88,8 @@ const createRegistry = (diagnostics: PluginDiagnostic[]): PluginRegistry => ({
   webFetchProviders: [],
   webSearchProviders: [],
   memoryEmbeddingProviders: [],
+  embeddedExtensionFactories: [],
+  codexAppServerExtensionFactories: [],
   textTransforms: [],
   agentHarnesses: [],
   gatewayHandlers: {},
@@ -200,8 +202,7 @@ async function createSubagentRuntime(
 
 async function reloadServerPluginsModule(): Promise<ServerPluginsModule> {
   vi.resetModules();
-  await loadTestModules();
-  return serverPluginsModule;
+  return await import("./server-plugins.js");
 }
 
 function loadGatewayPluginsForTest(
@@ -554,6 +555,46 @@ describe("loadGatewayPlugins", () => {
       model: "claude-haiku-4-5",
       deliver: false,
     });
+  });
+
+  test("forwards caller-supplied idempotencyKey on subagent run", async () => {
+    const serverPlugins = serverPluginsModule;
+    const runtime = await createSubagentRuntime(serverPlugins);
+    serverPlugins.setFallbackGatewayContext(createTestContext("idempotency-forward"));
+
+    await runtime.run({
+      sessionKey: "s-idem-forward",
+      message: "hello",
+      deliver: false,
+      idempotencyKey: "caller-provided-key",
+    });
+
+    expect(getLastDispatchedParams()).toMatchObject({
+      sessionKey: "s-idem-forward",
+      message: "hello",
+      idempotencyKey: "caller-provided-key",
+    });
+  });
+
+  test("generates a non-empty idempotencyKey when the caller omits it", async () => {
+    const serverPlugins = serverPluginsModule;
+    const runtime = await createSubagentRuntime(serverPlugins);
+    serverPlugins.setFallbackGatewayContext(createTestContext("idempotency-generate"));
+
+    await runtime.run({
+      sessionKey: "s-idem-generate",
+      message: "hello",
+      deliver: false,
+    });
+
+    const params = getLastDispatchedParams();
+    expect(params).toBeDefined();
+    // The gateway `agent` schema requires `idempotencyKey: NonEmptyString`, so
+    // the runtime must always send a populated value. A missing field here
+    // would reproduce the memory-core dreaming-narrative regression.
+    const generated = params?.idempotencyKey;
+    expect(typeof generated).toBe("string");
+    expect((generated as string).length).toBeGreaterThan(0);
   });
 
   test("rejects provider/model overrides for fallback runs without explicit authorization", async () => {

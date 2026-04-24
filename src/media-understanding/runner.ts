@@ -20,6 +20,7 @@ import type {
   MediaUnderstandingModelConfig,
 } from "../config/types.tools.js";
 import { logVerbose, shouldLogVerbose } from "../globals.js";
+import { logWarn } from "../logger.js";
 import { resolveChannelInboundAttachmentRoots } from "../media/channel-inbound-roots.js";
 import { mergeInboundPathRoots } from "../media/inbound-path-policy.js";
 import { getDefaultMediaLocalRoots } from "../media/local-roots.js";
@@ -37,6 +38,7 @@ import {
   getMediaUnderstandingProvider,
   normalizeMediaProviderId,
 } from "./provider-registry.js";
+import { providerSupportsCapability } from "./provider-supports.js";
 import { resolveModelEntries, resolveScopeDecision } from "./resolve.js";
 import {
   buildModelDecision,
@@ -61,22 +63,6 @@ export type RunCapabilityResult = {
   outputs: MediaUnderstandingOutput[];
   decision: MediaUnderstandingDecision;
 };
-
-function providerSupportsCapability(
-  provider: MediaUnderstandingProvider | undefined,
-  capability: MediaUnderstandingCapability,
-): boolean {
-  if (!provider) {
-    return false;
-  }
-  if (capability === "audio") {
-    return Boolean(provider.transcribeAudio);
-  }
-  if (capability === "image") {
-    return Boolean(provider.describeImage);
-  }
-  return Boolean(provider.describeVideo);
-}
 
 function resolveConfiguredKeyProviderOrder(params: {
   cfg: OpenClawConfig;
@@ -524,6 +510,10 @@ async function resolveAutoEntries(params: {
     return [activeEntry];
   }
   if (params.capability === "audio") {
+    const keyEntry = await resolveKeyEntry(params);
+    if (keyEntry) {
+      return [keyEntry];
+    }
     const localAudio = await resolveLocalAudioEntry();
     if (localAudio) {
       return [localAudio];
@@ -725,6 +715,12 @@ async function runAttachmentEntries(params: {
   return { output: null, attempts };
 }
 
+function hasFailedMediaAttempt(attachments: MediaUnderstandingDecision["attachments"]): boolean {
+  return attachments.some((attachment) =>
+    attachment.attempts.some((attempt) => attempt.outcome === "failed"),
+  );
+}
+
 export async function runCapability(params: {
   capability: MediaUnderstandingCapability;
   cfg: OpenClawConfig;
@@ -861,10 +857,17 @@ export async function runCapability(params: {
   }
   const decision: MediaUnderstandingDecision = {
     capability,
-    outcome: outputs.length > 0 ? "success" : "skipped",
+    outcome:
+      outputs.length > 0
+        ? "success"
+        : hasFailedMediaAttempt(attachmentDecisions)
+          ? "failed"
+          : "skipped",
     attachments: attachmentDecisions,
   };
-  if (shouldLogVerbose()) {
+  if (decision.outcome === "failed") {
+    logWarn(`media-understanding: ${formatDecisionSummary(decision)}`);
+  } else if (shouldLogVerbose()) {
     logVerbose(`Media understanding ${formatDecisionSummary(decision)}`);
   }
   return {

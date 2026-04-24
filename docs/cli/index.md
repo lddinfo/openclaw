@@ -473,6 +473,7 @@ Chat messages support `/...` commands (text and native). See [/tools/slash-comma
 Highlights:
 
 - `/status` for quick diagnostics.
+- `/trace` for session-scoped plugin trace/debug lines.
 - `/config` for persisted config changes.
 - `/debug` for runtime-only config overrides (memory, not disk; requires `commands.debug: true`).
 
@@ -993,7 +994,7 @@ Options:
 - `-t, --to <dest>` (for session key and optional delivery)
 - `--session-id <id>`
 - `--agent <id>` (agent id; overrides routing bindings)
-- `--thinking <off|minimal|low|medium|high|xhigh>` (provider support varies; not model-gated at CLI level)
+- `--thinking <level>` (validated against the selected model's provider profile)
 - `--verbose <on|off>`
 - `--channel <channel>` (delivery channel; omit to use the main session channel)
 - `--reply-to <target>` (delivery target override, separate from session routing)
@@ -1530,6 +1531,9 @@ Options:
 - `--provider <name>`
 - `--json`
 - `--plain`
+
+`--all` includes bundled provider-owned static catalog rows before auth is
+configured. Rows remain unavailable until matching provider credentials exist.
 
 ### `models status`
 

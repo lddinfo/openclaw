@@ -1,42 +1,39 @@
-import { EventEmitter } from "node:events";
-import { PassThrough, Writable } from "node:stream";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { CodexAppServerClient } from "./client.js";
-import { listCodexAppServerModels } from "./models.js";
-import { resetSharedCodexAppServerClientForTests } from "./shared-client.js";
+import { createClientHarness } from "./test-support.js";
 
-function createClientHarness() {
-  const stdout = new PassThrough();
-  const writes: string[] = [];
-  const stdin = new Writable({
-    write(chunk, _encoding, callback) {
-      writes.push(chunk.toString());
-      callback();
-    },
-  });
-  const process = Object.assign(new EventEmitter(), {
-    stdin,
-    stdout,
-    stderr: new PassThrough(),
-    killed: false,
-    kill: vi.fn(() => {
-      process.killed = true;
-    }),
-  });
-  const client = CodexAppServerClient.fromTransportForTests(process);
-  return {
-    client,
-    writes,
-    send(message: unknown) {
-      stdout.write(`${JSON.stringify(message)}\n`);
-    },
+const mocks = vi.hoisted(() => {
+  const authBridge = {
+    startOptions: vi.fn(async ({ startOptions }) => startOptions),
   };
-}
+  const providerAuth = {
+    agentDir: vi.fn(() => "/tmp/openclaw-agent"),
+  };
+  return { authBridge, providerAuth };
+});
+
+vi.mock("./auth-bridge.js", () => ({
+  bridgeCodexAppServerStartOptions: mocks.authBridge.startOptions,
+}));
+
+vi.mock("openclaw/plugin-sdk/provider-auth", () => ({
+  resolveOpenClawAgentDir: mocks.providerAuth.agentDir,
+}));
+
+let listCodexAppServerModels: typeof import("./models.js").listCodexAppServerModels;
+let resetSharedCodexAppServerClientForTests: typeof import("./shared-client.js").resetSharedCodexAppServerClientForTests;
 
 describe("listCodexAppServerModels", () => {
+  beforeAll(async () => {
+    ({ listCodexAppServerModels } = await import("./models.js"));
+    ({ resetSharedCodexAppServerClientForTests } = await import("./shared-client.js"));
+  });
+
   afterEach(() => {
     resetSharedCodexAppServerClientForTests();
     vi.restoreAllMocks();
+    mocks.authBridge.startOptions.mockClear();
+    mocks.providerAuth.agentDir.mockClear();
   });
 
   it("lists app-server models through the typed helper", async () => {
@@ -44,6 +41,7 @@ describe("listCodexAppServerModels", () => {
     const startSpy = vi.spyOn(CodexAppServerClient, "start").mockReturnValue(harness.client);
 
     const listPromise = listCodexAppServerModels({ limit: 12, timeoutMs: 1000 });
+    await vi.waitFor(() => expect(harness.writes.length).toBeGreaterThanOrEqual(1));
     const initialize = JSON.parse(harness.writes[0] ?? "{}") as { id?: number };
     harness.send({
       id: initialize.id,

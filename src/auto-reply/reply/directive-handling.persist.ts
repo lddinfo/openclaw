@@ -10,8 +10,9 @@ import { updateSessionStore } from "../../config/sessions/store.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { enqueueSystemEvent } from "../../infra/system-events.js";
-import { applyVerboseOverride } from "../../sessions/level-overrides.js";
+import { applyTraceOverride, applyVerboseOverride } from "../../sessions/level-overrides.js";
 import { applyModelOverrideToSessionEntry } from "../../sessions/model-overrides.js";
+import { isThinkingLevelSupported, resolveSupportedThinkingLevel } from "../thinking.js";
 import { resolveModelSelectionFromDirective } from "./directive-handling.model-selection.js";
 import type { InlineDirectives } from "./directive-handling.parse.js";
 import {
@@ -19,7 +20,14 @@ import {
   canPersistInternalVerboseDirective,
   enqueueModeSwitchEvents,
 } from "./directive-handling.shared.js";
-import type { ElevatedLevel, ReasoningLevel } from "./directives.js";
+import type { ElevatedLevel, ReasoningLevel, ThinkLevel } from "./directives.js";
+
+export type PersistedThinkingLevelRemap = {
+  from: ThinkLevel;
+  to: ThinkLevel;
+  provider: string;
+  model: string;
+};
 
 export async function persistInlineDirectives(params: {
   directives: InlineDirectives;
@@ -44,7 +52,14 @@ export async function persistInlineDirectives(params: {
   messageProvider?: string;
   surface?: string;
   gatewayClientScopes?: string[];
-}): Promise<{ provider: string; model: string; contextTokens: number }> {
+  senderIsOwner?: boolean;
+  markLiveSwitchPending?: boolean;
+}): Promise<{
+  provider: string;
+  model: string;
+  contextTokens: number;
+  thinkingRemap?: PersistedThinkingLevelRemap;
+}> {
   const {
     directives,
     cfg,
@@ -63,6 +78,7 @@ export async function persistInlineDirectives(params: {
     agentCfg,
   } = params;
   let { provider, model } = params;
+  let thinkingRemap: PersistedThinkingLevelRemap | undefined;
   const allowInternalExecPersistence = canPersistInternalExecDirective({
     messageProvider: params.messageProvider,
     surface: params.surface,
@@ -73,6 +89,7 @@ export async function persistInlineDirectives(params: {
     surface: params.surface,
     gatewayClientScopes: params.gatewayClientScopes,
   });
+  const delegatedTraceAllowed = (params.gatewayClientScopes ?? []).includes("operator.admin");
   const activeAgentId = sessionKey
     ? resolveSessionAgentId({ sessionKey, config: cfg })
     : resolveDefaultAgentId(cfg);
@@ -103,6 +120,14 @@ export async function persistInlineDirectives(params: {
       allowInternalVerbosePersistence
     ) {
       applyVerboseOverride(sessionEntry, directives.verboseLevel);
+      updated = true;
+    }
+    if (
+      directives.hasTraceDirective &&
+      directives.traceLevel &&
+      (params.senderIsOwner || delegatedTraceAllowed)
+    ) {
+      applyTraceOverride(sessionEntry, directives.traceLevel);
       updated = true;
     }
     if (directives.hasReasoningDirective && directives.reasoningLevel) {
@@ -175,9 +200,36 @@ export async function persistInlineDirectives(params: {
           entry: sessionEntry,
           selection: modelResolution.modelSelection,
           profileOverride: modelResolution.profileOverride,
+          markLiveSwitchPending: params.markLiveSwitchPending,
         });
         provider = modelResolution.modelSelection.provider;
         model = modelResolution.modelSelection.model;
+        const currentThinkingLevel = sessionEntry.thinkingLevel as ThinkLevel | undefined;
+        if (
+          currentThinkingLevel &&
+          !directives.hasThinkDirective &&
+          !isThinkingLevelSupported({
+            provider,
+            model,
+            level: currentThinkingLevel,
+          })
+        ) {
+          const remappedThinkingLevel = resolveSupportedThinkingLevel({
+            provider,
+            model,
+            level: currentThinkingLevel,
+          });
+          if (remappedThinkingLevel !== currentThinkingLevel) {
+            sessionEntry.thinkingLevel = remappedThinkingLevel;
+            thinkingRemap = {
+              from: currentThinkingLevel,
+              to: remappedThinkingLevel,
+              provider,
+              model,
+            };
+            updated = true;
+          }
+        }
         const nextLabel = `${provider}/${model}`;
         if (nextLabel !== initialModelLabel) {
           enqueueSystemEvent(
@@ -220,6 +272,7 @@ export async function persistInlineDirectives(params: {
   return {
     provider,
     model,
+    thinkingRemap,
     contextTokens:
       resolveContextTokensForModel({
         cfg,

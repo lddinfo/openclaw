@@ -12,7 +12,7 @@ import {
   resolveThreadBindingMaxAgeMsForChannel,
   resolveThreadBindingSpawnPolicy,
 } from "openclaw/plugin-sdk/conversation-runtime";
-import { formatUncaughtError } from "openclaw/plugin-sdk/error-runtime";
+import { formatErrorMessage, formatUncaughtError } from "openclaw/plugin-sdk/error-runtime";
 import { resolveTextChunkLimit } from "openclaw/plugin-sdk/reply-chunking";
 import { DEFAULT_GROUP_HISTORY_LIMIT, type HistoryEntry } from "openclaw/plugin-sdk/reply-history";
 import { danger, logVerbose, shouldLogVerbose } from "openclaw/plugin-sdk/runtime-env";
@@ -75,6 +75,12 @@ type TelegramCompatFetch = (
   input: TelegramFetchInput,
   init?: TelegramFetchInit,
 ) => ReturnType<TelegramClientFetch>;
+type TelegramAbortSignalLike = {
+  aborted: boolean;
+  reason?: unknown;
+  addEventListener: (type: "abort", listener: () => void, options?: { once?: boolean }) => void;
+  removeEventListener: (type: "abort", listener: () => void) => void;
+};
 
 function asTelegramClientFetch(
   fetchImpl: TelegramCompatFetch | typeof globalThis.fetch,
@@ -84,6 +90,17 @@ function asTelegramClientFetch(
 
 function asTelegramCompatFetch(fetchImpl: TelegramClientFetch): TelegramCompatFetch {
   return fetchImpl as unknown as TelegramCompatFetch;
+}
+
+function isTelegramAbortSignalLike(value: unknown): value is TelegramAbortSignalLike {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "aborted" in value &&
+    typeof (value as { aborted?: unknown }).aborted === "boolean" &&
+    typeof (value as { addEventListener?: unknown }).addEventListener === "function" &&
+    typeof (value as { removeEventListener?: unknown }).removeEventListener === "function"
+  );
 }
 
 function readRequestUrl(input: TelegramFetchInput): string | null {
@@ -131,6 +148,7 @@ export function createTelegramBot(opts: TelegramBotOptions): TelegramBotInstance
   });
   const threadBindingManager = threadBindingPolicy.enabled
     ? createTelegramThreadBindingManager({
+        cfg,
         accountId: account.accountId,
         idleTimeoutMs: resolveThreadBindingIdleTimeoutMsForChannel({
           cfg,
@@ -171,8 +189,11 @@ export function createTelegramBot(opts: TelegramBotOptions): TelegramBotInstance
     // causing "signals[0] must be an instance of AbortSignal" errors).
     finalFetch = (input: TelegramFetchInput, init?: TelegramFetchInit) => {
       const controller = new AbortController();
-      const abortWith = (signal: AbortSignal) => controller.abort(signal.reason);
-      const shutdownSignal = opts.fetchAbortSignal;
+      const abortWith = (signal: Pick<TelegramAbortSignalLike, "reason">) =>
+        controller.abort(signal.reason);
+      const shutdownSignal = isTelegramAbortSignalLike(opts.fetchAbortSignal)
+        ? opts.fetchAbortSignal
+        : undefined;
       const onShutdown = () => {
         if (shutdownSignal) {
           abortWith(shutdownSignal);
@@ -182,7 +203,7 @@ export function createTelegramBot(opts: TelegramBotOptions): TelegramBotInstance
       const requestTimeoutMs = resolveTelegramRequestTimeoutMs(method);
       let requestTimeout: ReturnType<typeof setTimeout> | undefined;
       let onRequestAbort: (() => void) | undefined;
-      const requestSignal = init?.signal;
+      const requestSignal = isTelegramAbortSignalLike(init?.signal) ? init.signal : undefined;
       if (shutdownSignal?.aborted) {
         abortWith(shutdownSignal);
       } else if (shutdownSignal) {
@@ -256,6 +277,8 @@ export function createTelegramBot(opts: TelegramBotOptions): TelegramBotInstance
   });
 
   const recentUpdates = createTelegramUpdateDedupe();
+  const pendingUpdateKeys = new Set<string>();
+  const activeHandledUpdateKeys = new Map<string, boolean>();
   const initialUpdateId =
     typeof opts.updateOffset?.lastUpdateId === "number" ? opts.updateOffset.lastUpdateId : null;
 
@@ -264,6 +287,7 @@ export function createTelegramBot(opts: TelegramBotOptions): TelegramBotInstance
   // We only persist a watermark that is strictly less than the smallest pending update_id,
   // so we never write an offset that would skip an update still waiting to run.
   const pendingUpdateIds = new Set<number>();
+  const failedUpdateIds = new Set<number>();
   let highestCompletedUpdateId: number | null = initialUpdateId;
   let highestPersistedUpdateId: number | null = initialUpdateId;
   const maybePersistSafeWatermark = () => {
@@ -285,11 +309,32 @@ export function createTelegramBot(opts: TelegramBotOptions): TelegramBotInstance
         safe = Math.min(safe, minPending - 1);
       }
     }
+    if (failedUpdateIds.size > 0) {
+      let minFailed: number | null = null;
+      for (const id of failedUpdateIds) {
+        if (minFailed === null || id < minFailed) {
+          minFailed = id;
+        }
+      }
+      if (minFailed !== null) {
+        safe = Math.min(safe, minFailed - 1);
+      }
+    }
     if (highestPersistedUpdateId !== null && safe <= highestPersistedUpdateId) {
       return;
     }
     highestPersistedUpdateId = safe;
-    void opts.updateOffset.onUpdateId(safe);
+    void Promise.resolve()
+      .then(() => opts.updateOffset?.onUpdateId?.(safe))
+      .catch((err) => {
+        runtime.error?.(`telegram: failed to persist update watermark: ${formatErrorMessage(err)}`);
+      });
+  };
+
+  const logSkippedUpdate = (key: string) => {
+    if (shouldLogVerbose()) {
+      logVerbose(`telegram dedupe: skipped ${key}`);
+    }
   };
 
   const shouldSkipUpdate = (ctx: TelegramUpdateKeyContext) => {
@@ -299,27 +344,65 @@ export function createTelegramBot(opts: TelegramBotOptions): TelegramBotInstance
       return true;
     }
     const key = buildTelegramUpdateKey(ctx);
+    if (!key) {
+      return false;
+    }
+    const handled = activeHandledUpdateKeys.get(key);
+    if (handled != null) {
+      if (handled) {
+        logSkippedUpdate(key);
+        return true;
+      }
+      activeHandledUpdateKeys.set(key, true);
+      return false;
+    }
     const skipped = recentUpdates.check(key);
-    if (skipped && key && shouldLogVerbose()) {
-      logVerbose(`telegram dedupe: skipped ${key}`);
+    if (skipped) {
+      logSkippedUpdate(key);
     }
     return skipped;
   };
 
   bot.use(async (ctx, next) => {
     const updateId = resolveTelegramUpdateId(ctx);
+    const updateKey = buildTelegramUpdateKey(ctx);
+    let completed = false;
     if (typeof updateId === "number") {
+      failedUpdateIds.delete(updateId);
       pendingUpdateIds.add(updateId);
+    }
+    if (updateKey) {
+      if (pendingUpdateKeys.has(updateKey) || recentUpdates.peek(updateKey)) {
+        logSkippedUpdate(updateKey);
+        if (typeof updateId === "number") {
+          pendingUpdateIds.delete(updateId);
+        }
+        return;
+      }
+      pendingUpdateKeys.add(updateKey);
+      activeHandledUpdateKeys.set(updateKey, false);
     }
     try {
       await next();
+      completed = true;
     } finally {
+      if (updateKey) {
+        activeHandledUpdateKeys.delete(updateKey);
+        if (completed) {
+          recentUpdates.check(updateKey);
+        }
+        pendingUpdateKeys.delete(updateKey);
+      }
       if (typeof updateId === "number") {
         pendingUpdateIds.delete(updateId);
-        if (highestCompletedUpdateId === null || updateId > highestCompletedUpdateId) {
-          highestCompletedUpdateId = updateId;
+        if (completed) {
+          if (highestCompletedUpdateId === null || updateId > highestCompletedUpdateId) {
+            highestCompletedUpdateId = updateId;
+          }
+          maybePersistSafeWatermark();
+        } else {
+          failedUpdateIds.add(updateId);
         }
-        maybePersistSafeWatermark();
       }
     }
   });

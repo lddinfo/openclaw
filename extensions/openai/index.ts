@@ -6,6 +6,7 @@ import {
   openaiCodexMediaUnderstandingProvider,
   openaiMediaUnderstandingProvider,
 } from "./media-understanding-provider.js";
+import { openAiMemoryEmbeddingProviderAdapter } from "./memory-embedding-adapter.js";
 import { buildOpenAICodexProviderPlugin } from "./openai-codex-provider.js";
 import { buildOpenAIProvider } from "./openai-provider.js";
 import {
@@ -31,6 +32,8 @@ export default definePluginEntry({
       ...openAIToolCompatHooks,
       resolveSystemPromptContribution: (ctx) =>
         resolveOpenAISystemPromptContribution({
+          config: ctx.config,
+          legacyPluginConfig: api.pluginConfig,
           mode: promptOverlayMode,
           modelProviderId: provider.id,
           modelId: ctx.modelId,
@@ -39,6 +42,7 @@ export default definePluginEntry({
     api.registerCliBackend(buildOpenAICodexCliBackend());
     api.registerProvider(buildProviderWithPromptContribution(buildOpenAIProvider()));
     api.registerProvider(buildProviderWithPromptContribution(buildOpenAICodexProviderPlugin()));
+    api.registerMemoryEmbeddingProvider(openAiMemoryEmbeddingProviderAdapter);
     api.registerImageGenerationProvider(buildOpenAIImageGenerationProvider());
     api.registerRealtimeTranscriptionProvider(buildOpenAIRealtimeTranscriptionProvider());
     api.registerRealtimeVoiceProvider(buildOpenAIRealtimeVoiceProvider());

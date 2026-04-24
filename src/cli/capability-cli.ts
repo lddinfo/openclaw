@@ -1,5 +1,8 @@
+import { createWriteStream } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import type { Command } from "commander";
 import { agentCommand } from "../agents/agent-command.js";
 import { resolveAgentDir, resolveDefaultAgentId } from "../agents/agent-scope.js";
@@ -22,6 +25,7 @@ import { generateImage, listRuntimeImageGenerationProviders } from "../image-gen
 import { buildMediaUnderstandingRegistry } from "../media-understanding/provider-registry.js";
 import {
   describeImageFile,
+  describeImageFileWithModel,
   describeVideoFile,
   transcribeAudioFile,
 } from "../media-understanding/runtime.js";
@@ -37,6 +41,7 @@ import {
   registerMemoryEmbeddingProvider,
 } from "../plugins/memory-embedding-providers.js";
 import { writeRuntimeJson, defaultRuntime, type RuntimeEnv } from "../runtime.js";
+import { getProviderEnvVars } from "../secrets/provider-env-vars.js";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
@@ -745,21 +750,32 @@ async function runImageDescribe(params: {
   model?: string;
 }) {
   const cfg = loadConfig();
+  const agentDir = resolveAgentDir(cfg, resolveDefaultAgentId(cfg));
   const activeModel = requireProviderModelOverride(params.model);
   const outputs = await Promise.all(
     params.files.map(async (filePath) => {
-      const result = await describeImageFile({
-        filePath: path.resolve(filePath),
-        cfg,
-        activeModel,
-      });
+      const resolvedPath = path.resolve(filePath);
+      const result = activeModel
+        ? await describeImageFileWithModel({
+            filePath: resolvedPath,
+            cfg,
+            agentDir,
+            provider: activeModel.provider,
+            model: activeModel.model,
+            prompt: "Describe the image.",
+          })
+        : await describeImageFile({
+            filePath: resolvedPath,
+            cfg,
+            agentDir,
+          });
       if (!result.text) {
-        throw new Error(`No description returned for image: ${path.resolve(filePath)}`);
+        throw new Error(`No description returned for image: ${resolvedPath}`);
       }
       return {
-        path: path.resolve(filePath),
+        path: resolvedPath,
         text: result.text,
-        provider: result.provider,
+        provider: activeModel?.provider ?? ("provider" in result ? result.provider : undefined),
         model: result.model,
         kind: "image.description",
       };
@@ -825,9 +841,6 @@ async function runVideoGenerate(params: { prompt: string; model?: string; output
           throw new Error(`Failed to download video from ${video.url}: ${response.status}`);
         }
         if (params.output && response.body) {
-          const { pipeline } = await import("node:stream/promises");
-          const { Readable } = await import("node:stream");
-          const { createWriteStream } = await import("node:fs");
           const mimeType = normalizeMimeType(video.mimeType);
           const ext =
             extensionForMime(mimeType) ||
@@ -1011,15 +1024,17 @@ async function runTtsProviders(transport: CapabilityTransport) {
       ...payload,
       providers: (payload.providers ?? []).map((provider) => {
         const id = typeof provider.id === "string" ? provider.id : "";
-        return {
-          available: true,
-          configured:
-            typeof provider.configured === "boolean"
-              ? provider.configured
-              : providerHasGenericConfig({ cfg, providerId: id }),
-          selected: Boolean(id && payload.active === id),
-          ...provider,
-        };
+        return Object.assign(
+          {
+            available: true,
+            configured:
+              typeof provider.configured === `boolean`
+                ? provider.configured
+                : providerHasGenericConfig({ cfg, providerId: id }),
+            selected: Boolean(id && payload.active === id),
+          },
+          provider,
+        );
       }),
     };
   }
@@ -1487,7 +1502,14 @@ export function registerCapabilityCli(program: Command) {
           .filter((provider) => provider.capabilities?.includes("audio"))
           .map((provider) => ({
             available: true,
-            configured: providerHasGenericConfig({ cfg, providerId: provider.id }),
+            configured: providerHasGenericConfig({
+              cfg,
+              providerId: provider.id,
+              envVars: getProviderEnvVars(provider.id, {
+                config: cfg,
+                includeUntrustedWorkspacePlugins: false,
+              }),
+            }),
             selected: false,
             id: provider.id,
             capabilities: provider.capabilities,

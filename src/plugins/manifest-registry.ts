@@ -15,6 +15,10 @@ import {
 } from "./config-policy.js";
 import { discoverOpenClawPlugins, type PluginCandidate } from "./discovery.js";
 import type { PluginManifestCommandAlias } from "./manifest-command-aliases.js";
+import {
+  clearPluginManifestRegistryCache,
+  pluginManifestRegistryCache,
+} from "./manifest-registry-state.js";
 import type {
   PluginBundleFormat,
   PluginConfigUiHint,
@@ -29,7 +33,10 @@ import {
   type PluginManifest,
   type PluginManifestChannelConfig,
   type PluginManifestContracts,
+  type PluginManifestMediaUnderstandingProviderMetadata,
   type PluginManifestModelSupport,
+  type PluginManifestProviderEndpoint,
+  type PluginManifestQaRunner,
   type PluginManifestSetup,
 } from "./manifest.js";
 import { checkMinHostVersion } from "./min-host-version.js";
@@ -80,7 +87,10 @@ export type PluginManifestRecord = {
   providers: string[];
   providerDiscoverySource?: string;
   modelSupport?: PluginManifestModelSupport;
+  providerEndpoints?: PluginManifestProviderEndpoint[];
   cliBackends: string[];
+  syntheticAuthRefs?: string[];
+  nonSecretAuthMarkers?: string[];
   commandAliases?: PluginManifestCommandAlias[];
   providerAuthEnvVars?: Record<string, string[]>;
   providerAuthAliases?: Record<string, string>;
@@ -88,6 +98,7 @@ export type PluginManifestRecord = {
   providerAuthChoices?: PluginManifest["providerAuthChoices"];
   activation?: PluginManifestActivation;
   setup?: PluginManifestSetup;
+  qaRunners?: PluginManifestQaRunner[];
   skills: string[];
   settingsFiles?: string[];
   hooks: string[];
@@ -102,6 +113,10 @@ export type PluginManifestRecord = {
   configSchema?: Record<string, unknown>;
   configUiHints?: Record<string, PluginConfigUiHint>;
   contracts?: PluginManifestContracts;
+  mediaUnderstandingProviderMetadata?: Record<
+    string,
+    PluginManifestMediaUnderstandingProviderMetadata
+  >;
   configContracts?: PluginManifestConfigContracts;
   channelConfigs?: Record<string, PluginManifestChannelConfig>;
   channelCatalogMeta?: {
@@ -117,14 +132,15 @@ export type PluginManifestRegistry = {
   diagnostics: PluginDiagnostic[];
 };
 
-const registryCache = new Map<string, { expiresAt: number; registry: PluginManifestRegistry }>();
+const registryCache = pluginManifestRegistryCache as Map<
+  string,
+  { expiresAt: number; registry: PluginManifestRegistry }
+>;
 
 // Keep a short cache window to collapse bursty reloads during startup flows.
 const DEFAULT_MANIFEST_CACHE_MS = 1000;
 
-export function clearPluginManifestRegistryCache(): void {
-  registryCache.clear();
-}
+export { clearPluginManifestRegistryCache } from "./manifest-registry-state.js";
 
 function listContractValues(
   plugin: PluginManifestRecord,
@@ -320,7 +336,10 @@ function buildRecord(params: {
       ? path.resolve(params.candidate.rootDir, params.manifest.providerDiscoveryEntry)
       : undefined,
     modelSupport: params.manifest.modelSupport,
+    providerEndpoints: params.manifest.providerEndpoints,
     cliBackends: params.manifest.cliBackends ?? [],
+    syntheticAuthRefs: params.manifest.syntheticAuthRefs ?? [],
+    nonSecretAuthMarkers: params.manifest.nonSecretAuthMarkers ?? [],
     commandAliases: params.manifest.commandAliases,
     providerAuthEnvVars: params.manifest.providerAuthEnvVars,
     providerAuthAliases: params.manifest.providerAuthAliases,
@@ -328,6 +347,7 @@ function buildRecord(params: {
     providerAuthChoices: params.manifest.providerAuthChoices,
     activation: params.manifest.activation,
     setup: params.manifest.setup,
+    qaRunners: params.manifest.qaRunners,
     skills: params.manifest.skills ?? [],
     settingsFiles: [],
     hooks: [],
@@ -344,6 +364,7 @@ function buildRecord(params: {
     configSchema: params.configSchema,
     configUiHints: params.manifest.uiHints,
     contracts: params.manifest.contracts,
+    mediaUnderstandingProviderMetadata: params.manifest.mediaUnderstandingProviderMetadata,
     configContracts: params.manifest.configContracts,
     channelConfigs,
     ...(params.candidate.packageManifest?.channel?.id
@@ -390,6 +411,8 @@ function buildBundleRecord(params: {
     channels: [],
     providers: [],
     cliBackends: [],
+    syntheticAuthRefs: [],
+    nonSecretAuthMarkers: [],
     skills: params.manifest.skills ?? [],
     settingsFiles: params.manifest.settingsFiles ?? [],
     hooks: params.manifest.hooks ?? [],
@@ -564,6 +587,20 @@ export function loadPluginManifestRegistry(
         : manifestRes.manifestPath;
     })();
 
+    const record = isBundleRecord
+      ? buildBundleRecord({
+          manifest: manifest as Parameters<typeof buildBundleRecord>[0]["manifest"],
+          candidate,
+          manifestPath: manifestRes.manifestPath,
+        })
+      : buildRecord({
+          manifest: manifest as PluginManifest,
+          candidate,
+          manifestPath: manifestRes.manifestPath,
+          schemaCacheKey,
+          configSchema,
+        });
+
     const existing = seenIds.get(manifest.id);
     if (existing) {
       // Check whether both candidates point to the same physical directory
@@ -582,62 +619,42 @@ export function loadPluginManifestRegistry(
         // Prefer higher-precedence origins even if candidates are passed in
         // an unexpected order (config > workspace > global > bundled).
         if (PLUGIN_ORIGIN_RANK[candidate.origin] < PLUGIN_ORIGIN_RANK[existing.candidate.origin]) {
-          records[existing.recordIndex] = isBundleRecord
-            ? buildBundleRecord({
-                manifest: manifest as Parameters<typeof buildBundleRecord>[0]["manifest"],
-                candidate,
-                manifestPath: manifestRes.manifestPath,
-              })
-            : buildRecord({
-                manifest: manifest as PluginManifest,
-                candidate,
-                manifestPath: manifestRes.manifestPath,
-                schemaCacheKey,
-                configSchema,
-              });
+          records[existing.recordIndex] = record;
           seenIds.set(manifest.id, { candidate, recordIndex: existing.recordIndex });
         }
         continue;
       }
+
+      const candidateRank = resolveDuplicatePrecedenceRank({
+        pluginId: manifest.id,
+        candidate,
+        config,
+        env,
+      });
+      const existingRank = resolveDuplicatePrecedenceRank({
+        pluginId: manifest.id,
+        candidate: existing.candidate,
+        config,
+        env,
+      });
+      const candidateWins = candidateRank < existingRank;
+      const winnerCandidate = candidateWins ? candidate : existing.candidate;
+      const overriddenCandidate = candidateWins ? existing.candidate : candidate;
+      if (candidateWins) {
+        records[existing.recordIndex] = record;
+        seenIds.set(manifest.id, { candidate, recordIndex: existing.recordIndex });
+      }
       diagnostics.push({
         level: "warn",
         pluginId: manifest.id,
-        source: candidate.source,
-        message:
-          resolveDuplicatePrecedenceRank({
-            pluginId: manifest.id,
-            candidate,
-            config,
-            env,
-          }) <
-          resolveDuplicatePrecedenceRank({
-            pluginId: manifest.id,
-            candidate: existing.candidate,
-            config,
-            env,
-          })
-            ? `duplicate plugin id detected; ${existing.candidate.origin} plugin will be overridden by ${candidate.origin} plugin (${candidate.source})`
-            : `duplicate plugin id detected; ${candidate.origin} plugin will be overridden by ${existing.candidate.origin} plugin (${candidate.source})`,
+        source: overriddenCandidate.source,
+        message: `duplicate plugin id detected; ${overriddenCandidate.origin} plugin will be overridden by ${winnerCandidate.origin} plugin (${winnerCandidate.source})`,
       });
-    } else {
-      seenIds.set(manifest.id, { candidate, recordIndex: records.length });
+      continue;
     }
 
-    records.push(
-      isBundleRecord
-        ? buildBundleRecord({
-            manifest: manifest as Parameters<typeof buildBundleRecord>[0]["manifest"],
-            candidate,
-            manifestPath: manifestRes.manifestPath,
-          })
-        : buildRecord({
-            manifest: manifest as PluginManifest,
-            candidate,
-            manifestPath: manifestRes.manifestPath,
-            schemaCacheKey,
-            configSchema,
-          }),
-    );
+    seenIds.set(manifest.id, { candidate, recordIndex: records.length });
+    records.push(record);
   }
 
   const registry = { plugins: records, diagnostics };

@@ -54,6 +54,7 @@ let resolveProviderDefaultThinkingLevel: typeof import("./provider-runtime.js").
 let resolveProviderModernModelRef: typeof import("./provider-runtime.js").resolveProviderModernModelRef;
 let resolveProviderReasoningOutputModeWithPlugin: typeof import("./provider-runtime.js").resolveProviderReasoningOutputModeWithPlugin;
 let resolveProviderReplayPolicyWithPlugin: typeof import("./provider-runtime.js").resolveProviderReplayPolicyWithPlugin;
+let resolveProviderSystemPromptContribution: typeof import("./provider-runtime.js").resolveProviderSystemPromptContribution;
 let resolveExternalAuthProfilesWithPlugins: typeof import("./provider-runtime.js").resolveExternalAuthProfilesWithPlugins;
 let resolveProviderSyntheticAuthWithPlugin: typeof import("./provider-runtime.js").resolveProviderSyntheticAuthWithPlugin;
 let shouldDeferProviderSyntheticProfileAuthWithPlugin: typeof import("./provider-runtime.js").shouldDeferProviderSyntheticProfileAuthWithPlugin;
@@ -69,6 +70,7 @@ let prepareProviderRuntimeAuth: typeof import("./provider-runtime.js").preparePr
 let resetProviderRuntimeHookCacheForTest: typeof import("./provider-runtime.js").resetProviderRuntimeHookCacheForTest;
 let refreshProviderOAuthCredentialWithPlugin: typeof import("./provider-runtime.js").refreshProviderOAuthCredentialWithPlugin;
 let resolveProviderRuntimePlugin: typeof import("./provider-runtime.js").resolveProviderRuntimePlugin;
+let providerRuntimeTesting: typeof import("./provider-runtime.js").__testing;
 let runProviderDynamicModel: typeof import("./provider-runtime.js").runProviderDynamicModel;
 let validateProviderReplayTurnsWithPlugin: typeof import("./provider-runtime.js").validateProviderReplayTurnsWithPlugin;
 let wrapProviderStreamFn: typeof import("./provider-runtime.js").wrapProviderStreamFn;
@@ -131,6 +133,7 @@ function createOpenAiCatalogProviderPlugin(
       { provider: "openai", id: "gpt-5.4-mini", name: "gpt-5.4-mini" },
       { provider: "openai", id: "gpt-5.4-nano", name: "gpt-5.4-nano" },
       { provider: "openai-codex", id: "gpt-5.4", name: "gpt-5.4" },
+      { provider: "openai-codex", id: "gpt-5.4-pro", name: "gpt-5.4-pro" },
       { provider: "openai-codex", id: "gpt-5.4-mini", name: "gpt-5.4-mini" },
       {
         provider: "openai-codex",
@@ -267,6 +270,7 @@ describe("provider-runtime", () => {
       resolveProviderModernModelRef,
       resolveProviderReasoningOutputModeWithPlugin,
       resolveProviderReplayPolicyWithPlugin,
+      resolveProviderSystemPromptContribution,
       resolveExternalAuthProfilesWithPlugins,
       resolveProviderSyntheticAuthWithPlugin,
       shouldDeferProviderSyntheticProfileAuthWithPlugin,
@@ -282,6 +286,7 @@ describe("provider-runtime", () => {
       resetProviderRuntimeHookCacheForTest,
       refreshProviderOAuthCredentialWithPlugin,
       resolveProviderRuntimePlugin,
+      __testing: providerRuntimeTesting,
       runProviderDynamicModel,
       validateProviderReplayTurnsWithPlugin,
       wrapProviderStreamFn,
@@ -328,6 +333,26 @@ describe("provider-runtime", () => {
       provider: "claude-cli",
       expectedPluginId: "anthropic",
     });
+  });
+
+  it("normalizes plugin scopes in provider hook cache keys", () => {
+    const base = {
+      workspaceDir: "/tmp/workspace",
+      env: { OPENCLAW_HOME: "/tmp/openclaw-home" } as NodeJS.ProcessEnv,
+      providerRefs: ["demo"],
+    };
+
+    expect(
+      providerRuntimeTesting.buildHookProviderCacheKey({
+        ...base,
+        onlyPluginIds: [" beta ", "alpha", "beta"],
+      }),
+    ).toBe(
+      providerRuntimeTesting.buildHookProviderCacheKey({
+        ...base,
+        onlyPluginIds: ["alpha", "beta"],
+      }),
+    );
   });
 
   it("returns provider-prepared runtime auth for the matched provider", async () => {
@@ -377,6 +402,58 @@ describe("provider-runtime", () => {
     expectProviderRuntimePluginLoad({
       provider: "anthropic",
     });
+  });
+
+  it("applies the shared GPT-5 prompt overlay for any provider", () => {
+    const contribution = resolveProviderSystemPromptContribution({
+      provider: "openrouter",
+      context: {
+        provider: "openrouter",
+        modelId: "openai/gpt-5.4",
+        promptMode: "full",
+      } as never,
+    });
+
+    expect(contribution?.stablePrefix).toContain("<persona_latch>");
+    expect(contribution?.sectionOverrides?.interaction_style).toContain(
+      "This is a live chat, not a memo.",
+    );
+  });
+
+  it("respects the shared GPT-5 prompt overlay personality config", () => {
+    const contribution = resolveProviderSystemPromptContribution({
+      provider: "opencode",
+      config: {
+        agents: {
+          defaults: {
+            promptOverlays: {
+              gpt5: { personality: "off" },
+            },
+          },
+        },
+      },
+      context: {
+        provider: "opencode",
+        modelId: "gpt-5.4",
+        promptMode: "full",
+      } as never,
+    });
+
+    expect(contribution?.stablePrefix).toContain("<persona_latch>");
+    expect(contribution?.sectionOverrides).toEqual({});
+  });
+
+  it("does not apply the shared GPT-5 prompt overlay to non-GPT-5 models", () => {
+    expect(
+      resolveProviderSystemPromptContribution({
+        provider: "openrouter",
+        context: {
+          provider: "openrouter",
+          modelId: "openai/gpt-4.1",
+          promptMode: "full",
+        } as never,
+      }),
+    ).toBeUndefined();
   });
 
   it("can normalize model ids through provider aliases without changing ownership", () => {

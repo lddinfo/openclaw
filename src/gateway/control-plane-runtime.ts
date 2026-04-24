@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { resolveStateDir } from "../config/paths.js";
 
 // AGENT_BOT_COMPAT: persisted runtime state for control-plane bootstrap/sync.
 
@@ -63,11 +64,18 @@ export type ControlPlaneRuntimeState = {
   skillSnapshot?: ControlPlaneSkillSnapshotState;
 };
 
-const defaultStateFile = path.join(process.cwd(), ".openclaw", "control-plane-state.json");
+const CONTROL_PLANE_STATE_FILENAME = "control-plane-state.json";
+
+function resolveDefaultStateFile(): string {
+  // Resolve against OpenClaw's canonical state dir (derived from HOME / OPENCLAW_HOME /
+  // OPENCLAW_STATE_DIR) instead of process.cwd(), which is "/" under launchd and would
+  // otherwise produce the invalid path "/.openclaw/control-plane-state.json".
+  return path.join(resolveStateDir(process.env), CONTROL_PLANE_STATE_FILENAME);
+}
 
 function resolveStateFilePath(): string {
   const raw = process.env.OPENCLAW_CONTROL_PLANE_STATE_FILE?.trim();
-  return raw ? path.resolve(raw) : defaultStateFile;
+  return raw ? path.resolve(raw) : resolveDefaultStateFile();
 }
 
 function ensureStateDir(): void {

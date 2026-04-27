@@ -12,6 +12,7 @@ import {
 import { bumpSkillsSnapshotVersion } from "../agents/skills/refresh-state.js";
 import {
   DEFAULT_AGENTS_FILENAME,
+  DEFAULT_BOOTSTRAP_FILENAME,
   DEFAULT_IDENTITY_FILENAME,
   DEFAULT_MEMORY_ALT_FILENAME,
   DEFAULT_MEMORY_FILENAME,
@@ -763,7 +764,9 @@ async function replaceWorkspaceWithFiles(params: {
   try {
     const staged = await ensureAgentWorkspace({
       dir: nextDir,
-      ensureBootstrapFiles: true,
+      // The control plane supplied an explicit workspace file set. Do not let
+      // OpenClaw seed BOOTSTRAP.md or other default bootstrap files into it.
+      ensureBootstrapFiles: false,
     });
     for (const file of params.files) {
       await writeTextFile(path.join(staged.dir, file.name), file.content);
@@ -800,7 +803,9 @@ async function clearLocalAgentWorkspace(
   await fs.rm(workspaceDir, { recursive: true, force: true });
   const workspace = await ensureAgentWorkspace({
     dir: workspaceDir,
-    ensureBootstrapFiles: true,
+    // Managed control-plane workspaces are populated by sync payloads; do not
+    // create BOOTSTRAP.md when clearing/recreating them.
+    ensureBootstrapFiles: false,
   });
   return {
     agentId: normalizedAgentId,
@@ -1380,6 +1385,10 @@ function parseWorkspaceFilesFromValue(value: unknown): Array<{ name: string; con
       content: typeof item.content === "string" ? item.content : "",
     }))
     .filter((item) => item.name && item.content);
+}
+
+function workspaceFilesInclude(files: Array<{ name: string }>, name: string): boolean {
+  return files.some((file) => file.name === name);
 }
 
 function parseReleaseDescriptor(body: JsonObject): ReleaseDescriptor {
@@ -2278,6 +2287,11 @@ async function ensureLocalAgentProvisioned(body: JsonObject): Promise<{
   }
 
   const explicitWorkspaceFiles = parseWorkspaceFilesFromValue(body.workspaceFiles);
+  const hasExplicitWorkspaceFiles = explicitWorkspaceFiles.length > 0;
+  const explicitWorkspaceIncludesBootstrap = workspaceFilesInclude(
+    explicitWorkspaceFiles,
+    DEFAULT_BOOTSTRAP_FILENAME,
+  );
   if (replaceExistingWorkspace && !preserveWorkspace && explicitWorkspaceFiles.length > 0) {
     await replaceWorkspaceWithFiles({
       workspaceDir: resolveAgentWorkspaceDir(cfg, requestedAgentId),
@@ -2295,8 +2309,14 @@ async function ensureLocalAgentProvisioned(body: JsonObject): Promise<{
 
   const workspace = await ensureAgentWorkspace({
     dir: resolveAgentWorkspaceDir(cfg, requestedAgentId),
-    ensureBootstrapFiles: true,
+    // When the control plane supplies an explicit workspace file list, the
+    // workspace is managed by that list. Seeding OpenClaw's defaults here would
+    // re-create BOOTSTRAP.md and conflict with plugin-driven memory flows.
+    ensureBootstrapFiles: !hasExplicitWorkspaceFiles && !cfg.agents?.defaults?.skipBootstrap,
   });
+  if (hasExplicitWorkspaceFiles && !explicitWorkspaceIncludesBootstrap) {
+    await fs.rm(path.join(workspace.dir, DEFAULT_BOOTSTRAP_FILENAME), { force: true });
+  }
   if (!preserveWorkspace) {
     const existingWorkspaceMetadata =
       explicitWorkspaceFiles.length > 0 ? {} : await loadExistingWorkspaceMetadata(workspace.dir);

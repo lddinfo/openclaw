@@ -938,16 +938,39 @@ async function clearLocalAgentWorkspace(
     return undefined;
   }
   const workspaceDir = resolveAgentWorkspaceDir(cfg, normalizedAgentId);
+  const agentDir = resolveAgentDir(cfg, normalizedAgentId);
   await fs.rm(workspaceDir, { recursive: true, force: true });
-  const workspace = await ensureAgentWorkspace({
-    dir: workspaceDir,
-    // Managed control-plane workspaces are populated by sync payloads; do not
-    // create BOOTSTRAP.md when clearing/recreating them.
-    ensureBootstrapFiles: false,
+  await fs.rm(agentDir, { recursive: true, force: true });
+  const currentCfg = loadConfig();
+  const remainingEntries = [...listAgentEntries(currentCfg)].filter(
+    (entry) => normalizeAgentId(entry.id) !== normalizedAgentId,
+  );
+  await writeConfigFile({
+    ...currentCfg,
+    agents: {
+      ...currentCfg.agents,
+      list: remainingEntries,
+    },
+  });
+  const currentState = loadControlPlaneRuntimeState();
+  const remainingRuntimeAgents = (currentState.agents ?? []).filter(
+    (entry) => normalizeAgentId(entry.agentId) !== normalizedAgentId,
+  );
+  mergeControlPlaneRuntimeState({
+    agents: remainingRuntimeAgents,
+    remoteAgentId:
+      remainingRuntimeAgents.length > 0
+        ? resolvePrimaryRuntimeRemoteAgentId({
+            cfg: loadConfig(),
+            currentState,
+            agents: remainingRuntimeAgents,
+            fallbackRemoteAgentId: remainingRuntimeAgents[0]?.remoteAgentId ?? "",
+          })
+        : undefined,
   });
   return {
     agentId: normalizedAgentId,
-    workspaceKey: path.basename(workspace.dir) || `workspace-${normalizedAgentId}`,
+    workspaceKey: path.basename(workspaceDir) || `workspace-${normalizedAgentId}`,
   };
 }
 
@@ -2659,6 +2682,36 @@ async function upsertRuntimeAgent(params: {
   };
 }
 
+async function clearTrainingWorkspaceFromBody(params: {
+  body: JsonObject;
+  deployedAgentId: string;
+}): Promise<{ agentId: string; workspaceKey: string } | undefined> {
+  const clearTrainingRemoteAgentId = readOptionalString(
+    params.body,
+    "clearTrainingRemoteAgentId",
+    "trainingRemoteAgentId",
+  );
+  const state = clearTrainingRemoteAgentId ? loadControlPlaneRuntimeState() : undefined;
+  const trainingAgentFromRemote = state?.agents?.find(
+    (entry) =>
+      normalizeRemoteAgentId(entry.remoteAgentId) ===
+        normalizeRemoteAgentId(clearTrainingRemoteAgentId) && entry.runtimeRole === "training",
+  );
+  const clearTrainingAgentId = normalizeAgentId(
+    readOptionalString(
+      params.body,
+      "clearTrainingWorkspaceAgentId",
+      "clearTrainingLocalAgentKey",
+    ) ??
+      trainingAgentFromRemote?.agentId ??
+      "",
+  );
+  if (!clearTrainingAgentId || clearTrainingAgentId === normalizeAgentId(params.deployedAgentId)) {
+    return undefined;
+  }
+  return clearLocalAgentWorkspace(loadConfig(), clearTrainingAgentId);
+}
+
 function buildReleaseExportPayload(params: {
   runtimeAgent: ControlPlaneRuntimeAgent;
   files: Array<{ name: string; content: string }>;
@@ -2979,6 +3032,16 @@ export async function handleControlPlaneHttpRequest(
         body,
         deploymentSource: "sync",
       });
+      const shouldClearTrainingWorkspace =
+        synced.runtimeRole === "serving" &&
+        (synced.releaseStatus === "released" ||
+          readOptionalString(body, "releaseStage") === "released");
+      const clearedTrainingWorkspace = shouldClearTrainingWorkspace
+        ? await clearTrainingWorkspaceFromBody({
+            body,
+            deployedAgentId: synced.agentId,
+          })
+        : undefined;
       sendJson(res, 200, {
         ok: true,
         agentId: synced.agentId,
@@ -2993,6 +3056,7 @@ export async function handleControlPlaneHttpRequest(
         releaseVersion: synced.releaseVersion,
         releaseStatus: synced.releaseStatus,
         releaseFileCount: synced.releaseFileCount,
+        clearedTrainingWorkspace,
         status: "ready",
         totalAgents: synced.totalAgents,
       });
@@ -3015,26 +3079,10 @@ export async function handleControlPlaneHttpRequest(
         deploymentSource: "release",
         defaultRuntimeRole: "serving",
       });
-      const clearTrainingRemoteAgentId = readOptionalString(
+      const clearedTrainingWorkspace = await clearTrainingWorkspaceFromBody({
         body,
-        "clearTrainingRemoteAgentId",
-        "trainingRemoteAgentId",
-      );
-      const state = clearTrainingRemoteAgentId ? loadControlPlaneRuntimeState() : undefined;
-      const trainingAgentFromRemote = state?.agents?.find(
-        (entry) =>
-          normalizeRemoteAgentId(entry.remoteAgentId) ===
-            normalizeRemoteAgentId(clearTrainingRemoteAgentId) && entry.runtimeRole === "training",
-      );
-      const clearTrainingAgentId = normalizeAgentId(
-        readOptionalString(body, "clearTrainingWorkspaceAgentId", "clearTrainingLocalAgentKey") ??
-          trainingAgentFromRemote?.agentId ??
-          "",
-      );
-      const clearedTrainingWorkspace =
-        clearTrainingAgentId && clearTrainingAgentId !== normalizeAgentId(deployed.agentId)
-          ? await clearLocalAgentWorkspace(loadConfig(), clearTrainingAgentId)
-          : undefined;
+        deployedAgentId: deployed.agentId,
+      });
       sendJson(res, 200, {
         ok: true,
         agentId: deployed.agentId,

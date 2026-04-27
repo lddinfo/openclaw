@@ -850,17 +850,19 @@ async function mergeTriLayerMemoryForWorkspaceReplace(params: {
       ? readOptionalString(mergeConfig, "sourceLocalAgentKey", "sourceAgentId")
       : undefined) ??
     readOptionalString(params.body, "sourceTrainingLocalAgentKey", "sourceLocalAgentKey");
+  const extraSourceLocalAgentKeys =
+    mergeConfig && Array.isArray(mergeConfig.extraSourceLocalAgentKeys)
+      ? mergeConfig.extraSourceLocalAgentKeys.filter(
+          (value): value is string => typeof value === "string" && value.trim().length > 0,
+        )
+      : [];
   const sourceRoots = [
     path.join(params.targetWorkspaceDir, memoryRootName, "tri-layer"),
-    ...(sourceLocalAgentKey
-      ? [
-          path.join(
-            resolveAgentWorkspaceDir(params.cfg, sourceLocalAgentKey),
-            memoryRootName,
-            "tri-layer",
-          ),
-        ]
-      : []),
+    ...[sourceLocalAgentKey, ...extraSourceLocalAgentKeys]
+      .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      .map((localAgentKey) =>
+        path.join(resolveAgentWorkspaceDir(params.cfg, localAgentKey), memoryRootName, "tri-layer"),
+      ),
   ];
   const targetRoot = path.join(params.stagedWorkspaceDir, memoryRootName, "tri-layer");
   const mergedSources: string[] = [];

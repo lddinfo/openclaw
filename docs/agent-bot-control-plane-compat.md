@@ -112,6 +112,13 @@ Optional compatibility routes also implemented:
 - `POST /__control-plane/agents/:remoteAgentId/undeploy`
 - `GET /__control-plane/portal/runs/:runId`
 
+`POST /__control-plane/agents/deploy` is the serving publish path. When a
+release bundle includes `release.files`, the runtime now stages those files in a
+temporary workspace and swaps them into the serving workspace as one directory
+move. The request may also pass `clearTrainingWorkspaceAgentId` /
+`clearTrainingLocalAgentKey`, or `clearTrainingRemoteAgentId`, to clear the
+training workspace after a successful deploy.
+
 To wire the runtime into the current base project:
 
 1. Point the runtime/base URL in `agent-bot-task-a` to this gateway, for example

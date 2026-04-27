@@ -746,6 +746,68 @@ async function copyWorkspaceTreeIfExists(params: {
   return true;
 }
 
+async function replaceWorkspaceWithFiles(params: {
+  workspaceDir: string;
+  files: Array<{ name: string; content: string }>;
+}): Promise<{ replacedExistingWorkspace: boolean }> {
+  const parentDir = path.dirname(params.workspaceDir);
+  const workspaceName = path.basename(params.workspaceDir) || "workspace";
+  const token = `${Date.now().toString(36)}-${randomUUID().replace(/-/g, "").slice(0, 8)}`;
+  const nextDir = path.join(parentDir, `.${workspaceName}.next-${token}`);
+  const previousDir = path.join(parentDir, `.${workspaceName}.previous-${token}`);
+  let movedExistingWorkspace = false;
+
+  await fs.rm(nextDir, { recursive: true, force: true });
+  await fs.rm(previousDir, { recursive: true, force: true });
+
+  try {
+    const staged = await ensureAgentWorkspace({
+      dir: nextDir,
+      ensureBootstrapFiles: true,
+    });
+    for (const file of params.files) {
+      await writeTextFile(path.join(staged.dir, file.name), file.content);
+    }
+
+    await fs.mkdir(parentDir, { recursive: true, mode: 0o700 });
+    if (await pathExists(params.workspaceDir)) {
+      await fs.rename(params.workspaceDir, previousDir);
+      movedExistingWorkspace = true;
+    }
+    await fs.rename(nextDir, params.workspaceDir);
+    if (movedExistingWorkspace) {
+      await fs.rm(previousDir, { recursive: true, force: true });
+    }
+    return { replacedExistingWorkspace: movedExistingWorkspace };
+  } catch (error) {
+    await fs.rm(nextDir, { recursive: true, force: true }).catch(() => undefined);
+    if (movedExistingWorkspace && !(await pathExists(params.workspaceDir))) {
+      await fs.rename(previousDir, params.workspaceDir).catch(() => undefined);
+    }
+    throw error;
+  }
+}
+
+async function clearLocalAgentWorkspace(
+  cfg: ReturnType<typeof loadConfig>,
+  agentId: string,
+): Promise<{ agentId: string; workspaceKey: string } | undefined> {
+  const normalizedAgentId = normalizeAgentId(agentId);
+  if (!normalizedAgentId) {
+    return undefined;
+  }
+  const workspaceDir = resolveAgentWorkspaceDir(cfg, normalizedAgentId);
+  await fs.rm(workspaceDir, { recursive: true, force: true });
+  const workspace = await ensureAgentWorkspace({
+    dir: workspaceDir,
+    ensureBootstrapFiles: true,
+  });
+  return {
+    agentId: normalizedAgentId,
+    workspaceKey: path.basename(workspace.dir) || `workspace-${normalizedAgentId}`,
+  };
+}
+
 function normalizePortalMode(value: unknown): PortalSessionMode {
   return typeof value === "string" && value.trim().toLowerCase() === "training"
     ? "training"
@@ -2142,6 +2204,13 @@ async function ensureLocalAgentProvisioned(body: JsonObject): Promise<{
     readOptionalBoolean(body, "preserveWorkspace", "preserveExistingWorkspace") === true;
   const createFreshWorkspace =
     readOptionalBoolean(body, "createFreshWorkspace", "freshWorkspace") === true;
+  const replaceExistingWorkspace =
+    readOptionalBoolean(
+      body,
+      "replaceExistingWorkspace",
+      "replaceWorkspace",
+      "atomicReplaceWorkspace",
+    ) === true;
   const cloneFromLocalAgentKey = normalizeAgentId(
     readOptionalString(body, "cloneFromLocalAgentKey", "cloneFromAgentId") || "",
   );
@@ -2208,12 +2277,27 @@ async function ensureLocalAgentProvisioned(body: JsonObject): Promise<{
     }
   }
 
+  const explicitWorkspaceFiles = parseWorkspaceFilesFromValue(body.workspaceFiles);
+  if (replaceExistingWorkspace && !preserveWorkspace && explicitWorkspaceFiles.length > 0) {
+    await replaceWorkspaceWithFiles({
+      workspaceDir: resolveAgentWorkspaceDir(cfg, requestedAgentId),
+      files: explicitWorkspaceFiles,
+    });
+    return {
+      cfg,
+      agentId: requestedAgentId,
+      localAgentKey: requestedAgentId,
+      workspaceKey:
+        path.basename(resolveAgentWorkspaceDir(cfg, requestedAgentId)) ||
+        `workspace-${requestedAgentId}`,
+    };
+  }
+
   const workspace = await ensureAgentWorkspace({
     dir: resolveAgentWorkspaceDir(cfg, requestedAgentId),
     ensureBootstrapFiles: true,
   });
   if (!preserveWorkspace) {
-    const explicitWorkspaceFiles = parseWorkspaceFilesFromValue(body.workspaceFiles);
     const existingWorkspaceMetadata =
       explicitWorkspaceFiles.length > 0 ? {} : await loadExistingWorkspaceMetadata(workspace.dir);
     const workspaceFiles =
@@ -2313,7 +2397,15 @@ async function upsertRuntimeAgent(params: {
   const release = parseReleaseDescriptor(params.body);
   const provisionBody =
     release.releaseFiles.length > 0
-      ? { ...params.body, workspaceFiles: release.releaseFiles }
+      ? {
+          ...params.body,
+          workspaceFiles: release.releaseFiles,
+          ...(params.deploymentSource === "release" &&
+          readOptionalBoolean(params.body, "preserveWorkspace", "preserveExistingWorkspace") !==
+            true
+            ? { replaceExistingWorkspace: true }
+            : {}),
+        }
       : params.body;
   const provisioned = await ensureLocalAgentProvisioned(provisionBody);
   const agentId = provisioned.agentId;
@@ -2762,6 +2854,26 @@ export async function handleControlPlaneHttpRequest(
         deploymentSource: "release",
         defaultRuntimeRole: "serving",
       });
+      const clearTrainingRemoteAgentId = readOptionalString(
+        body,
+        "clearTrainingRemoteAgentId",
+        "trainingRemoteAgentId",
+      );
+      const state = clearTrainingRemoteAgentId ? loadControlPlaneRuntimeState() : undefined;
+      const trainingAgentFromRemote = state?.agents?.find(
+        (entry) =>
+          normalizeRemoteAgentId(entry.remoteAgentId) ===
+            normalizeRemoteAgentId(clearTrainingRemoteAgentId) && entry.runtimeRole === "training",
+      );
+      const clearTrainingAgentId = normalizeAgentId(
+        readOptionalString(body, "clearTrainingWorkspaceAgentId", "clearTrainingLocalAgentKey") ??
+          trainingAgentFromRemote?.agentId ??
+          "",
+      );
+      const clearedTrainingWorkspace =
+        clearTrainingAgentId && clearTrainingAgentId !== normalizeAgentId(deployed.agentId)
+          ? await clearLocalAgentWorkspace(loadConfig(), clearTrainingAgentId)
+          : undefined;
       sendJson(res, 200, {
         ok: true,
         agentId: deployed.agentId,
@@ -2776,6 +2888,7 @@ export async function handleControlPlaneHttpRequest(
         releaseVersion: deployed.releaseVersion,
         releaseStatus: deployed.releaseStatus,
         releaseFileCount: deployed.releaseFileCount,
+        clearedTrainingWorkspace,
         status: "deployed",
         totalAgents: deployed.totalAgents,
       });

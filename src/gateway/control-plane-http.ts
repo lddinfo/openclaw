@@ -747,9 +747,137 @@ async function copyWorkspaceTreeIfExists(params: {
   return true;
 }
 
+async function readJsonFileIfExists(filePath: string): Promise<JsonObject | undefined> {
+  try {
+    return JSON.parse(await fs.readFile(filePath, "utf8")) as JsonObject;
+  } catch {
+    return undefined;
+  }
+}
+
+function mergeTriLayerIndex(
+  base: JsonObject | undefined,
+  incoming: JsonObject | undefined,
+): JsonObject | undefined {
+  if (!base && !incoming) {
+    return undefined;
+  }
+  const merged: JsonObject = {
+    ...base,
+    ...incoming,
+  };
+  const memoriesByKey = new Map<string, JsonObject>();
+  for (const source of [base, incoming]) {
+    const memories = Array.isArray(source?.memories) ? source.memories : [];
+    for (const item of memories) {
+      if (!isJsonObject(item)) {
+        continue;
+      }
+      const id = readOptionalString(item, "id");
+      const scope = readOptionalString(item, "scope") ?? "";
+      const normalizedSummary = readOptionalString(item, "normalizedSummary") ?? "";
+      const userKey = readOptionalString(item, "userKey") ?? "";
+      const sessionKey = readOptionalString(item, "sessionKey") ?? "";
+      const key = id || `${scope}:${userKey}:${sessionKey}:${normalizedSummary}`;
+      if (!key.trim()) {
+        continue;
+      }
+      const previous = memoriesByKey.get(key);
+      if (!previous) {
+        memoriesByKey.set(key, item);
+        continue;
+      }
+      const previousUpdatedAt = Date.parse(readOptionalString(previous, "updatedAt") ?? "") || 0;
+      const incomingUpdatedAt = Date.parse(readOptionalString(item, "updatedAt") ?? "") || 0;
+      if (incomingUpdatedAt >= previousUpdatedAt) {
+        memoriesByKey.set(key, {
+          ...previous,
+          ...item,
+        });
+      }
+    }
+  }
+  merged.memories = [...memoriesByKey.values()];
+  merged.updatedAt = new Date().toISOString();
+  return merged;
+}
+
+async function mergeTriLayerMemoryRoot(params: {
+  sourceRoot: string;
+  targetRoot: string;
+}): Promise<boolean> {
+  if (!(await pathExists(params.sourceRoot))) {
+    return false;
+  }
+  const targetIndexBefore = await readJsonFileIfExists(path.join(params.targetRoot, "index.json"));
+  const sourceIndex = await readJsonFileIfExists(path.join(params.sourceRoot, "index.json"));
+  await fs.mkdir(params.targetRoot, { recursive: true, mode: 0o700 });
+  await fs.cp(params.sourceRoot, params.targetRoot, { recursive: true, force: true });
+  const mergedIndex = mergeTriLayerIndex(targetIndexBefore, sourceIndex);
+  if (mergedIndex) {
+    await fs.writeFile(
+      path.join(params.targetRoot, "index.json"),
+      `${JSON.stringify(mergedIndex, null, 2)}\n`,
+      {
+        encoding: "utf8",
+        mode: 0o600,
+      },
+    );
+  }
+  return true;
+}
+
+async function mergeTriLayerMemoryForWorkspaceReplace(params: {
+  cfg: ReturnType<typeof loadConfig>;
+  targetWorkspaceDir: string;
+  stagedWorkspaceDir: string;
+  body: JsonObject;
+}): Promise<{ merged: boolean; sources: string[] }> {
+  const mergeConfig = readOptionalObject(params.body, "mergeTriLayerMemory", "triLayerMemoryMerge");
+  const enabled = mergeConfig
+    ? readOptionalBoolean(mergeConfig, "enabled") !== false
+    : readOptionalBoolean(params.body, "mergeTriLayerMemory", "triLayerMemoryMerge") === true;
+  if (!enabled) {
+    return { merged: false, sources: [] };
+  }
+
+  const memoryRootName =
+    (mergeConfig ? readOptionalString(mergeConfig, "memoryRootName") : undefined) ??
+    readOptionalString(params.body, "memoryRootName") ??
+    ".tri-layer-memory";
+  const sourceLocalAgentKey =
+    (mergeConfig
+      ? readOptionalString(mergeConfig, "sourceLocalAgentKey", "sourceAgentId")
+      : undefined) ??
+    readOptionalString(params.body, "sourceTrainingLocalAgentKey", "sourceLocalAgentKey");
+  const sourceRoots = [
+    path.join(params.targetWorkspaceDir, memoryRootName, "tri-layer"),
+    ...(sourceLocalAgentKey
+      ? [
+          path.join(
+            resolveAgentWorkspaceDir(params.cfg, sourceLocalAgentKey),
+            memoryRootName,
+            "tri-layer",
+          ),
+        ]
+      : []),
+  ];
+  const targetRoot = path.join(params.stagedWorkspaceDir, memoryRootName, "tri-layer");
+  const mergedSources: string[] = [];
+  for (const sourceRoot of sourceRoots) {
+    if (await mergeTriLayerMemoryRoot({ sourceRoot, targetRoot })) {
+      mergedSources.push(sourceRoot);
+    }
+  }
+  return { merged: mergedSources.length > 0, sources: mergedSources };
+}
+
 async function replaceWorkspaceWithFiles(params: {
   workspaceDir: string;
   files: Array<{ name: string; content: string }>;
+  cfg?: ReturnType<typeof loadConfig>;
+  agentId?: string;
+  body?: JsonObject;
 }): Promise<{ replacedExistingWorkspace: boolean }> {
   const parentDir = path.dirname(params.workspaceDir);
   const workspaceName = path.basename(params.workspaceDir) || "workspace";
@@ -770,6 +898,14 @@ async function replaceWorkspaceWithFiles(params: {
     });
     for (const file of params.files) {
       await writeTextFile(path.join(staged.dir, file.name), file.content);
+    }
+    if (params.cfg && params.agentId && params.body) {
+      await mergeTriLayerMemoryForWorkspaceReplace({
+        cfg: params.cfg,
+        targetWorkspaceDir: params.workspaceDir,
+        stagedWorkspaceDir: staged.dir,
+        body: params.body,
+      });
     }
 
     await fs.mkdir(parentDir, { recursive: true, mode: 0o700 });
@@ -2296,6 +2432,9 @@ async function ensureLocalAgentProvisioned(body: JsonObject): Promise<{
     await replaceWorkspaceWithFiles({
       workspaceDir: resolveAgentWorkspaceDir(cfg, requestedAgentId),
       files: explicitWorkspaceFiles,
+      cfg,
+      agentId: requestedAgentId,
+      body,
     });
     return {
       cfg,

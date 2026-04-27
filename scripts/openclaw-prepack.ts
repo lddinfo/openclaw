@@ -43,6 +43,11 @@ export function collectPreparedPrepackErrors(
   return errors;
 }
 
+export function isPreparedPrepackRequested(env: NodeJS.ProcessEnv = process.env): boolean {
+  const value = env.OPENCLAW_PREPACK_PREPARED?.trim().toLowerCase();
+  return value === "1" || value === "true";
+}
+
 function collectPreparedFilePaths(reader: PreparedFileReader = { existsSync, readdirSync }): {
   files: Set<string>;
   assets: string[];
@@ -110,6 +115,13 @@ async function writeDistInventory(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  if (isPreparedPrepackRequested()) {
+    ensurePreparedArtifacts();
+    await writeDistInventory();
+    runBuildSmoke();
+    return;
+  }
+
   const pnpmCommand = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
   run(pnpmCommand, ["build"]);
   run(pnpmCommand, ["ui:build"]);

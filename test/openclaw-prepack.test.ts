@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { collectPreparedPrepackErrors } from "../scripts/openclaw-prepack.ts";
+import {
+  collectPreparedPrepackErrors,
+  isPreparedPrepackRequested,
+} from "../scripts/openclaw-prepack.ts";
 
 describe("collectPreparedPrepackErrors", () => {
   it("accepts prepared release artifacts", () => {
@@ -17,5 +20,19 @@ describe("collectPreparedPrepackErrors", () => {
       "missing required prepared artifact: dist/control-ui/index.html",
       "missing prepared Control UI asset payload under dist/control-ui/assets/",
     ]);
+  });
+});
+
+describe("isPreparedPrepackRequested", () => {
+  it("accepts explicit prepared prepack flags", () => {
+    expect(isPreparedPrepackRequested({ OPENCLAW_PREPACK_PREPARED: "1" })).toBe(true);
+    expect(isPreparedPrepackRequested({ OPENCLAW_PREPACK_PREPARED: "true" })).toBe(true);
+    expect(isPreparedPrepackRequested({ OPENCLAW_PREPACK_PREPARED: "TRUE" })).toBe(true);
+  });
+
+  it("rejects missing or disabled prepared prepack flags", () => {
+    expect(isPreparedPrepackRequested({})).toBe(false);
+    expect(isPreparedPrepackRequested({ OPENCLAW_PREPACK_PREPARED: "0" })).toBe(false);
+    expect(isPreparedPrepackRequested({ OPENCLAW_PREPACK_PREPARED: "false" })).toBe(false);
   });
 });

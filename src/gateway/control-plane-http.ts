@@ -731,18 +731,20 @@ function readOptionalObject(body: JsonObject, ...keys: string[]): JsonObject | u
   return undefined;
 }
 
-async function copyWorkspaceTreeIfExists(params: {
+// Incremental, non-destructive merge of source workspace tree into target.
+// 与 copyWorkspaceTreeIfExists 的区别：不先 fs.rm target —— 同名文件被 source 覆盖，
+// target 里独有的文件保留，source 里独有的新增。供"训练 workspace 合并到运行时 workspace"
+// 与"v2 候选首次同步从 latest released clone"两条路径共用。
+async function mergeWorkspaceTreeIfExists(params: {
   cfg: ReturnType<typeof loadConfig>;
   sourceAgentId: string;
   targetWorkspaceDir: string;
 }): Promise<boolean> {
   const sourceWorkspaceDir = resolveAgentWorkspaceDir(params.cfg, params.sourceAgentId);
-  try {
-    await fs.access(sourceWorkspaceDir);
-  } catch {
+  if (!(await pathExists(sourceWorkspaceDir))) {
     return false;
   }
-  await fs.rm(params.targetWorkspaceDir, { recursive: true, force: true });
+  await fs.mkdir(params.targetWorkspaceDir, { recursive: true, mode: 0o700 });
   await fs.cp(sourceWorkspaceDir, params.targetWorkspaceDir, { recursive: true, force: true });
   return true;
 }
@@ -827,106 +829,112 @@ async function mergeTriLayerMemoryRoot(params: {
   return true;
 }
 
-async function mergeTriLayerMemoryForWorkspaceReplace(params: {
+// 把训练 workspace（以及兼容旧契约的 extraSourceLocalAgentKeys 列表）的内容
+// 增量合并到目标 workspace。语义：同名文件被 source 覆盖、target 里独有的文件保留、
+// source 里独有的新增；最后用控制面提供的"权威 markdown"覆盖一遍这些 markdown。
+//
+// 关键点：
+//   1. 不再先把整个 target workspace 重命名 / 删除，因此用户在 target 里安装的
+//      skills/<key>/、iqiyi_source/ 这类运行时产物会保留。
+//   2. .tri-layer-memory/tri-layer/index.json 在 fs.cp 之后会被 source 索引覆盖，
+//      所以在 cp 前先快照旧 target 索引，cp 后用 mergeTriLayerIndex 把两边条目并起来再写回。
+//   3. 旧契约里的 mergeTriLayerMemory.extraSourceLocalAgentKeys（早期把"未稳定的 serving
+//      workspace"当 extra source 喂进来）继续支持，避免回退。
+async function mergeWorkspaceWithFiles(params: {
+  workspaceDir: string;
+  files: Array<{ name: string; content: string }>;
   cfg: ReturnType<typeof loadConfig>;
-  targetWorkspaceDir: string;
-  stagedWorkspaceDir: string;
+  agentId: string;
   body: JsonObject;
-}): Promise<{ merged: boolean; sources: string[] }> {
-  const mergeConfig = readOptionalObject(params.body, "mergeTriLayerMemory", "triLayerMemoryMerge");
-  const enabled = mergeConfig
-    ? readOptionalBoolean(mergeConfig, "enabled") !== false
-    : readOptionalBoolean(params.body, "mergeTriLayerMemory", "triLayerMemoryMerge") === true;
-  if (!enabled) {
-    return { merged: false, sources: [] };
-  }
+}): Promise<{ mergedSources: string[] }> {
+  await fs.mkdir(params.workspaceDir, { recursive: true, mode: 0o700 });
+  const ensured = await ensureAgentWorkspace({
+    dir: params.workspaceDir,
+    // 控制面已经显式给了 workspace 文件清单，OpenClaw 不再自动 seed BOOTSTRAP.md，
+    // 否则会和 tri-layer-memory 等插件托管的记忆流冲突。
+    ensureBootstrapFiles: false,
+  });
 
+  const mergeConfig = readOptionalObject(params.body, "mergeTriLayerMemory", "triLayerMemoryMerge");
   const memoryRootName =
     (mergeConfig ? readOptionalString(mergeConfig, "memoryRootName") : undefined) ??
     readOptionalString(params.body, "memoryRootName") ??
     ".tri-layer-memory";
-  const sourceLocalAgentKey =
-    (mergeConfig
-      ? readOptionalString(mergeConfig, "sourceLocalAgentKey", "sourceAgentId")
-      : undefined) ??
-    readOptionalString(params.body, "sourceTrainingLocalAgentKey", "sourceLocalAgentKey");
-  const extraSourceLocalAgentKeys =
-    mergeConfig && Array.isArray(mergeConfig.extraSourceLocalAgentKeys)
+  const targetMemoryIndexPath = path.join(ensured.dir, memoryRootName, "tri-layer", "index.json");
+  const oldTargetMemoryIndex = await readJsonFileIfExists(targetMemoryIndexPath);
+
+  const mergeFromLocalAgentKey = normalizeAgentId(
+    readOptionalString(
+      params.body,
+      "mergeFromLocalAgentKey",
+      "mergeFromAgentId",
+      "sourceTrainingLocalAgentKey",
+      "sourceLocalAgentKey",
+    ) ??
+      (mergeConfig
+        ? readOptionalString(mergeConfig, "sourceLocalAgentKey", "sourceAgentId")
+        : undefined) ??
+      "",
+  );
+
+  const mergedSources: string[] = [];
+  if (mergeFromLocalAgentKey && mergeFromLocalAgentKey !== normalizeAgentId(params.agentId)) {
+    const sourceWorkspaceDir = resolveAgentWorkspaceDir(params.cfg, mergeFromLocalAgentKey);
+    if (await pathExists(sourceWorkspaceDir)) {
+      // 增量 cp：source 同名覆盖 target，target 独有保留，source 独有新增。
+      await fs.cp(sourceWorkspaceDir, ensured.dir, { recursive: true, force: true });
+      mergedSources.push(sourceWorkspaceDir);
+    }
+  }
+
+  // cp 之后 target 的 .tri-layer-memory/tri-layer/index.json 已被 source 覆盖。
+  // 用旧 target 索引 + 当前文件（即 source 索引）做 mergeTriLayerIndex 后写回，
+  // 防止 target 历史记忆条目被 source 索引挤掉。
+  if (mergedSources.length > 0 && oldTargetMemoryIndex) {
+    const newSourceMemoryIndex = await readJsonFileIfExists(targetMemoryIndexPath);
+    if (newSourceMemoryIndex) {
+      const merged = mergeTriLayerIndex(oldTargetMemoryIndex, newSourceMemoryIndex);
+      if (merged) {
+        await fs.mkdir(path.dirname(targetMemoryIndexPath), {
+          recursive: true,
+          mode: 0o700,
+        });
+        await fs.writeFile(targetMemoryIndexPath, `${JSON.stringify(merged, null, 2)}\n`, {
+          encoding: "utf8",
+          mode: 0o600,
+        });
+      }
+    }
+  }
+
+  // 兼容旧契约：mergeTriLayerMemory.extraSourceLocalAgentKeys
+  if (mergeConfig) {
+    const extraKeys = Array.isArray(mergeConfig.extraSourceLocalAgentKeys)
       ? mergeConfig.extraSourceLocalAgentKeys.filter(
           (value): value is string => typeof value === "string" && value.trim().length > 0,
         )
       : [];
-  const sourceRoots = [
-    path.join(params.targetWorkspaceDir, memoryRootName, "tri-layer"),
-    ...[sourceLocalAgentKey, ...extraSourceLocalAgentKeys]
-      .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
-      .map((localAgentKey) =>
-        path.join(resolveAgentWorkspaceDir(params.cfg, localAgentKey), memoryRootName, "tri-layer"),
-      ),
-  ];
-  const targetRoot = path.join(params.stagedWorkspaceDir, memoryRootName, "tri-layer");
-  const mergedSources: string[] = [];
-  for (const sourceRoot of sourceRoots) {
-    if (await mergeTriLayerMemoryRoot({ sourceRoot, targetRoot })) {
-      mergedSources.push(sourceRoot);
+    const targetMemoryRoot = path.dirname(targetMemoryIndexPath);
+    for (const key of extraKeys) {
+      const extraDir = resolveAgentWorkspaceDir(params.cfg, key);
+      const extraMemoryRoot = path.join(extraDir, memoryRootName, "tri-layer");
+      if (
+        await mergeTriLayerMemoryRoot({
+          sourceRoot: extraMemoryRoot,
+          targetRoot: targetMemoryRoot,
+        })
+      ) {
+        mergedSources.push(extraMemoryRoot);
+      }
     }
   }
-  return { merged: mergedSources.length > 0, sources: mergedSources };
-}
 
-async function replaceWorkspaceWithFiles(params: {
-  workspaceDir: string;
-  files: Array<{ name: string; content: string }>;
-  cfg?: ReturnType<typeof loadConfig>;
-  agentId?: string;
-  body?: JsonObject;
-}): Promise<{ replacedExistingWorkspace: boolean }> {
-  const parentDir = path.dirname(params.workspaceDir);
-  const workspaceName = path.basename(params.workspaceDir) || "workspace";
-  const token = `${Date.now().toString(36)}-${randomUUID().replace(/-/g, "").slice(0, 8)}`;
-  const nextDir = path.join(parentDir, `.${workspaceName}.next-${token}`);
-  const previousDir = path.join(parentDir, `.${workspaceName}.previous-${token}`);
-  let movedExistingWorkspace = false;
-
-  await fs.rm(nextDir, { recursive: true, force: true });
-  await fs.rm(previousDir, { recursive: true, force: true });
-
-  try {
-    const staged = await ensureAgentWorkspace({
-      dir: nextDir,
-      // The control plane supplied an explicit workspace file set. Do not let
-      // OpenClaw seed BOOTSTRAP.md or other default bootstrap files into it.
-      ensureBootstrapFiles: false,
-    });
-    for (const file of params.files) {
-      await writeTextFile(path.join(staged.dir, file.name), file.content);
-    }
-    if (params.cfg && params.agentId && params.body) {
-      await mergeTriLayerMemoryForWorkspaceReplace({
-        cfg: params.cfg,
-        targetWorkspaceDir: params.workspaceDir,
-        stagedWorkspaceDir: staged.dir,
-        body: params.body,
-      });
-    }
-
-    await fs.mkdir(parentDir, { recursive: true, mode: 0o700 });
-    if (await pathExists(params.workspaceDir)) {
-      await fs.rename(params.workspaceDir, previousDir);
-      movedExistingWorkspace = true;
-    }
-    await fs.rename(nextDir, params.workspaceDir);
-    if (movedExistingWorkspace) {
-      await fs.rm(previousDir, { recursive: true, force: true });
-    }
-    return { replacedExistingWorkspace: movedExistingWorkspace };
-  } catch (error) {
-    await fs.rm(nextDir, { recursive: true, force: true }).catch(() => undefined);
-    if (movedExistingWorkspace && !(await pathExists(params.workspaceDir))) {
-      await fs.rename(previousDir, params.workspaceDir).catch(() => undefined);
-    }
-    throw error;
+  // 最后用控制面提供的"权威 markdown"覆盖一次，确保 AGENTS.md / SOUL.md 等始终是最新版本。
+  for (const file of params.files) {
+    await writeTextFile(path.join(ensured.dir, file.name), file.content);
   }
+
+  return { mergedSources };
 }
 
 async function clearLocalAgentWorkspace(
@@ -2427,23 +2435,22 @@ async function ensureLocalAgentProvisioned(body: JsonObject): Promise<{
   }
 
   if (createFreshWorkspace) {
+    // 历史语义是"擦掉 target 后再 clone / 留空目录"，会把训练人员在训练 workspace 里
+    // 装好的 skills/<key>/、本地脚本、共享文件等一起删掉。新语义改为非破坏性：
+    //   - 如果 target workspace 还不存在，且给了 cloneFromLocalAgentKey，则把 clone source
+    //     的内容 cp 进去作为初始内容（v2 候选首次同步从 latest released clone 的诉求）。
+    //   - 如果 target workspace 已经存在（用户在训练里已经迭代过一轮），保持原样不动，
+    //     只让后续的 explicit workspaceFiles 覆盖控制面文档；防止重复点"同步训练状态"
+    //     把训练里的 skill 等文件擦掉。
     if (cloneFromLocalAgentKey && cloneFromLocalAgentKey !== requestedAgentId) {
-      const cloned = await copyWorkspaceTreeIfExists({
-        cfg,
-        sourceAgentId: cloneFromLocalAgentKey,
-        targetWorkspaceDir: resolveAgentWorkspaceDir(cfg, requestedAgentId),
-      });
-      if (!cloned) {
-        await fs.rm(resolveAgentWorkspaceDir(cfg, requestedAgentId), {
-          recursive: true,
-          force: true,
+      const targetWorkspaceDir = resolveAgentWorkspaceDir(cfg, requestedAgentId);
+      if (!(await pathExists(targetWorkspaceDir))) {
+        await mergeWorkspaceTreeIfExists({
+          cfg,
+          sourceAgentId: cloneFromLocalAgentKey,
+          targetWorkspaceDir,
         });
       }
-    } else {
-      await fs.rm(resolveAgentWorkspaceDir(cfg, requestedAgentId), {
-        recursive: true,
-        force: true,
-      });
     }
   }
 
@@ -2454,7 +2461,11 @@ async function ensureLocalAgentProvisioned(body: JsonObject): Promise<{
     DEFAULT_BOOTSTRAP_FILENAME,
   );
   if (replaceExistingWorkspace && !preserveWorkspace && explicitWorkspaceFiles.length > 0) {
-    await replaceWorkspaceWithFiles({
+    // 历史语义是"用 explicit workspaceFiles 整个替换 target 目录（只有 .tri-layer-memory 幸存）"，
+    // 这会把发布前用户在 target workspace 里安装的 skills/、iqiyi_source/、其他运行时文件全部清掉。
+    // 新语义：把 mergeFromLocalAgentKey 指向的训练 workspace 增量合并进 target，再用 explicit
+    // workspaceFiles 覆盖一遍控制面 markdown，target 里的"target 独有文件"被原样保留。
+    await mergeWorkspaceWithFiles({
       workspaceDir: resolveAgentWorkspaceDir(cfg, requestedAgentId),
       files: explicitWorkspaceFiles,
       cfg,

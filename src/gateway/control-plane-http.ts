@@ -24,6 +24,7 @@ import { loadConfig, writeConfigFile } from "../config/config.js";
 import { onAgentEvent, type AgentEventPayload } from "../infra/agent-events.js";
 import type { ExecApprovalDecision } from "../infra/exec-approvals.js";
 import { isPathInside } from "../infra/path-guards.js";
+import { logInfo, logWarn } from "../logger.js";
 import type { PromptImageOrderEntry } from "../media/prompt-image-order.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import { defaultRuntime } from "../runtime.js";
@@ -731,6 +732,78 @@ function readOptionalObject(body: JsonObject, ...keys: string[]): JsonObject | u
   return undefined;
 }
 
+// 受控的递归目录"增量合并"：把 source 下所有常规文件复制到 target 同名路径，
+// 同名文件被 source 覆盖，target 里独有的文件保留，source 里独有的文件新增。
+// 实现上故意不依赖 Node 的 fs.cp({recursive,force}) ——
+//   1) 不同 Node 版本对符号链接 / 跨设备复制 / 已存在空目录 / 与目标同名的 dirent 类型不一致
+//      时行为不一致甚至静默忽略；
+//   2) 我们需要在每个文件粒度上拿到"被覆盖了什么"的准确信息，以便诊断 skill 丢失问题。
+// 跳过符号链接和非常规文件（socket/fifo/blockdev），避免把宿主机上不应被序列化的资源
+// 复制到目标 workspace。
+async function copyDirectoryTreeIncremental(params: {
+  sourceDir: string;
+  targetDir: string;
+  // 相对于 sourceDir 的相对路径前缀，递归调用时使用。
+  relativePrefix?: string;
+}): Promise<{
+  filesCopied: string[];
+  directoriesCreated: string[];
+  symlinksSkipped: string[];
+  specialSkipped: string[];
+}> {
+  const filesCopied: string[] = [];
+  const directoriesCreated: string[] = [];
+  const symlinksSkipped: string[] = [];
+  const specialSkipped: string[] = [];
+  const prefix = params.relativePrefix ?? "";
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await fs.readdir(params.sourceDir, { withFileTypes: true });
+  } catch {
+    return { filesCopied, directoriesCreated, symlinksSkipped, specialSkipped };
+  }
+  for (const entry of entries) {
+    const sourcePath = path.join(params.sourceDir, entry.name);
+    const targetPath = path.join(params.targetDir, entry.name);
+    const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isSymbolicLink()) {
+      symlinksSkipped.push(relativePath);
+      continue;
+    }
+    if (entry.isDirectory()) {
+      await fs.mkdir(targetPath, { recursive: true, mode: 0o700 });
+      directoriesCreated.push(relativePath);
+      const childResult = await copyDirectoryTreeIncremental({
+        sourceDir: sourcePath,
+        targetDir: targetPath,
+        relativePrefix: relativePath,
+      });
+      filesCopied.push(...childResult.filesCopied);
+      directoriesCreated.push(...childResult.directoriesCreated);
+      symlinksSkipped.push(...childResult.symlinksSkipped);
+      specialSkipped.push(...childResult.specialSkipped);
+      continue;
+    }
+    if (!entry.isFile()) {
+      specialSkipped.push(relativePath);
+      continue;
+    }
+    try {
+      const buffer = await fs.readFile(sourcePath);
+      await fs.mkdir(path.dirname(targetPath), { recursive: true, mode: 0o700 });
+      await fs.writeFile(targetPath, buffer);
+      filesCopied.push(relativePath);
+    } catch (error) {
+      logWarn(
+        `control-plane: workspace merge failed to copy ${relativePath} from ${params.sourceDir} -> ${params.targetDir}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+  return { filesCopied, directoriesCreated, symlinksSkipped, specialSkipped };
+}
+
 // Incremental, non-destructive merge of source workspace tree into target.
 // 与 copyWorkspaceTreeIfExists 的区别：不先 fs.rm target —— 同名文件被 source 覆盖，
 // target 里独有的文件保留，source 里独有的新增。供"训练 workspace 合并到运行时 workspace"
@@ -742,10 +815,22 @@ async function mergeWorkspaceTreeIfExists(params: {
 }): Promise<boolean> {
   const sourceWorkspaceDir = resolveAgentWorkspaceDir(params.cfg, params.sourceAgentId);
   if (!(await pathExists(sourceWorkspaceDir))) {
+    logInfo(
+      `control-plane: skip workspace clone from "${params.sourceAgentId}" -> "${params.targetWorkspaceDir}" because source dir does not exist (${sourceWorkspaceDir})`,
+    );
     return false;
   }
   await fs.mkdir(params.targetWorkspaceDir, { recursive: true, mode: 0o700 });
-  await fs.cp(sourceWorkspaceDir, params.targetWorkspaceDir, { recursive: true, force: true });
+  const result = await copyDirectoryTreeIncremental({
+    sourceDir: sourceWorkspaceDir,
+    targetDir: params.targetWorkspaceDir,
+  });
+  logInfo(
+    `control-plane: cloned ${result.filesCopied.length} file(s) from ${sourceWorkspaceDir} into ${params.targetWorkspaceDir}` +
+      (result.symlinksSkipped.length
+        ? ` (skipped ${result.symlinksSkipped.length} symlink(s))`
+        : ""),
+  );
   return true;
 }
 
@@ -878,12 +963,42 @@ async function mergeWorkspaceWithFiles(params: {
   );
 
   const mergedSources: string[] = [];
-  if (mergeFromLocalAgentKey && mergeFromLocalAgentKey !== normalizeAgentId(params.agentId)) {
+  const normalizedTargetAgentId = normalizeAgentId(params.agentId);
+  if (!mergeFromLocalAgentKey) {
+    logInfo(
+      `control-plane: workspace merge for agent "${normalizedTargetAgentId}" — no mergeFromLocalAgentKey provided, only platform markdown files will be (over)written; user-installed skills under target are preserved.`,
+    );
+  } else if (mergeFromLocalAgentKey === normalizedTargetAgentId) {
+    logInfo(
+      `control-plane: workspace merge for agent "${normalizedTargetAgentId}" — mergeFromLocalAgentKey ("${mergeFromLocalAgentKey}") equals target agentId, source and target are the same workspace; skipping cp and only (over)writing platform markdown files.`,
+    );
+  } else {
     const sourceWorkspaceDir = resolveAgentWorkspaceDir(params.cfg, mergeFromLocalAgentKey);
-    if (await pathExists(sourceWorkspaceDir)) {
-      // 增量 cp：source 同名覆盖 target，target 独有保留，source 独有新增。
-      await fs.cp(sourceWorkspaceDir, ensured.dir, { recursive: true, force: true });
+    const sourceExists = await pathExists(sourceWorkspaceDir);
+    if (!sourceExists) {
+      logWarn(
+        `control-plane: workspace merge for agent "${normalizedTargetAgentId}" — mergeFromLocalAgentKey "${mergeFromLocalAgentKey}" resolves to ${sourceWorkspaceDir} but that path does not exist on this OpenClaw runtime; skills/files added in the training workspace WILL NOT propagate to the serving workspace.`,
+      );
+    } else {
+      const merge = await copyDirectoryTreeIncremental({
+        sourceDir: sourceWorkspaceDir,
+        targetDir: ensured.dir,
+      });
       mergedSources.push(sourceWorkspaceDir);
+      logInfo(
+        `control-plane: workspace merge for agent "${normalizedTargetAgentId}" — copied ${merge.filesCopied.length} file(s) from ${sourceWorkspaceDir} into ${ensured.dir}` +
+          (merge.symlinksSkipped.length
+            ? ` (skipped ${merge.symlinksSkipped.length} symlink(s): ${merge.symlinksSkipped.slice(0, 5).join(", ")})`
+            : "") +
+          (merge.specialSkipped.length
+            ? ` (skipped ${merge.specialSkipped.length} non-regular file(s))`
+            : ""),
+      );
+      if (merge.filesCopied.length === 0) {
+        logWarn(
+          `control-plane: workspace merge for agent "${normalizedTargetAgentId}" — source workspace ${sourceWorkspaceDir} exists but contains no copyable files; nothing was merged.`,
+        );
+      }
     }
   }
 
@@ -932,6 +1047,11 @@ async function mergeWorkspaceWithFiles(params: {
   // 最后用控制面提供的"权威 markdown"覆盖一次，确保 AGENTS.md / SOUL.md 等始终是最新版本。
   for (const file of params.files) {
     await writeTextFile(path.join(ensured.dir, file.name), file.content);
+  }
+  if (params.files.length > 0) {
+    logInfo(
+      `control-plane: workspace merge for agent "${normalizedTargetAgentId}" — overwrote ${params.files.length} platform markdown file(s) (${params.files.map((f) => f.name).join(", ")}) inside ${ensured.dir}`,
+    );
   }
 
   return { mergedSources };
@@ -2460,11 +2580,34 @@ async function ensureLocalAgentProvisioned(body: JsonObject): Promise<{
     explicitWorkspaceFiles,
     DEFAULT_BOOTSTRAP_FILENAME,
   );
-  if (replaceExistingWorkspace && !preserveWorkspace && explicitWorkspaceFiles.length > 0) {
+  // 兜底：只要请求里给了 mergeFromLocalAgentKey（=训练 workspace 的 localAgentKey），就走
+  // mergeWorkspaceWithFiles 路径。即使 explicitWorkspaceFiles 为空（控制面没有内联 markdown），
+  // 我们也要确保从训练 workspace 把 skills/<key>/、用户脚本等增量复制到 target；否则会落到
+  // 下方的 "ensureAgentWorkspace + writeTextFile" 路径，那条路径完全不会去碰训练 workspace，
+  // 就是导致"训练 workspace 加 skill → 发布上线后 serving workspace 没有"的根因之一。
+  const rawMergeFromLocalAgentKey = readOptionalString(
+    body,
+    "mergeFromLocalAgentKey",
+    "mergeFromAgentId",
+    "sourceTrainingLocalAgentKey",
+    "sourceLocalAgentKey",
+  );
+  const hasMergeFromLocalAgentKey =
+    typeof rawMergeFromLocalAgentKey === "string" &&
+    rawMergeFromLocalAgentKey.trim() !== "" &&
+    normalizeAgentId(rawMergeFromLocalAgentKey) !== normalizeAgentId(requestedAgentId);
+  const shouldMergeWorkspace =
+    !preserveWorkspace &&
+    (replaceExistingWorkspace || hasMergeFromLocalAgentKey) &&
+    (explicitWorkspaceFiles.length > 0 || hasMergeFromLocalAgentKey);
+  if (shouldMergeWorkspace) {
     // 历史语义是"用 explicit workspaceFiles 整个替换 target 目录（只有 .tri-layer-memory 幸存）"，
     // 这会把发布前用户在 target workspace 里安装的 skills/、iqiyi_source/、其他运行时文件全部清掉。
     // 新语义：把 mergeFromLocalAgentKey 指向的训练 workspace 增量合并进 target，再用 explicit
     // workspaceFiles 覆盖一遍控制面 markdown，target 里的"target 独有文件"被原样保留。
+    logInfo(
+      `control-plane: ensureLocalAgentProvisioned for "${requestedAgentId}" — taking workspace merge path (replaceExistingWorkspace=${replaceExistingWorkspace}, hasMergeFromLocalAgentKey=${hasMergeFromLocalAgentKey}, explicitWorkspaceFiles=${explicitWorkspaceFiles.length}).`,
+    );
     await mergeWorkspaceWithFiles({
       workspaceDir: resolveAgentWorkspaceDir(cfg, requestedAgentId),
       files: explicitWorkspaceFiles,

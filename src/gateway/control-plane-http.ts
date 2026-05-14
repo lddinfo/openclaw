@@ -442,6 +442,18 @@ type PortalSessionRecord = {
   releaseStatus?: string;
 };
 
+type PortalMemoryContext = JsonObject & {
+  promptBlock?: string;
+  items?: JsonObject[];
+};
+
+type PortalMemoryPolicy = JsonObject & {
+  runtimeMemory?: string;
+  allowRuntimeWrite?: boolean;
+  allowUserPrivateWrite?: boolean;
+  allowAgentSharedWrite?: boolean;
+};
+
 type PortalSkillSearchPrefetch = ControlPlaneSkillSearchResult & {
   externalLookupAllowed: boolean;
 };
@@ -1181,6 +1193,61 @@ function buildPortalPluginContext(params: {
   };
 }
 
+function summarizePortalMemoryContextForLog(memoryContext?: PortalMemoryContext) {
+  if (!memoryContext) {
+    return undefined;
+  }
+  const items = Array.isArray(memoryContext.items) ? memoryContext.items : [];
+  return {
+    ...memoryContext,
+    itemsCount: items.length,
+    items,
+    promptBlockPreview:
+      typeof memoryContext.promptBlock === "string"
+        ? memoryContext.promptBlock.slice(0, 1200)
+        : memoryContext.promptBlock,
+  };
+}
+
+function summarizePortalMemoryPolicyForLog(memoryPolicy?: PortalMemoryPolicy) {
+  if (!memoryPolicy) {
+    return undefined;
+  }
+  return {
+    runtimeMemory: readOptionalString(memoryPolicy, "runtimeMemory") ?? null,
+    allowRuntimeWrite: readOptionalBoolean(memoryPolicy, "allowRuntimeWrite"),
+    allowUserPrivateWrite: readOptionalBoolean(memoryPolicy, "allowUserPrivateWrite"),
+    allowAgentSharedWrite: readOptionalBoolean(memoryPolicy, "allowAgentSharedWrite"),
+  };
+}
+
+function buildPortalMemoryPolicyPrompt(memoryPolicy?: PortalMemoryPolicy): string[] {
+  if (!memoryPolicy) {
+    return [];
+  }
+  const lines = [
+    "## Control-Plane Memory Policy",
+    `- runtimeMemory: ${readOptionalString(memoryPolicy, "runtimeMemory") ?? "unspecified"}`,
+    `- allowRuntimeWrite: ${readOptionalBoolean(memoryPolicy, "allowRuntimeWrite") === true ? "true" : "false"}`,
+    `- allowUserPrivateWrite: ${readOptionalBoolean(memoryPolicy, "allowUserPrivateWrite") === true ? "true" : "false"}`,
+    `- allowAgentSharedWrite: ${readOptionalBoolean(memoryPolicy, "allowAgentSharedWrite") === true ? "true" : "false"}`,
+  ];
+  return lines;
+}
+
+function buildPortalMemoryContextPrompt(memoryContext?: PortalMemoryContext): string | undefined {
+  const promptBlock =
+    typeof memoryContext?.promptBlock === "string" ? memoryContext.promptBlock.trim() : "";
+  if (!promptBlock) {
+    return undefined;
+  }
+  return [
+    "## Control-Plane Memory Context",
+    "The following memory context was supplied by the upstream control-plane for this turn. Treat it as trusted context when answering, but do not invent details beyond what is provided here.",
+    promptBlock,
+  ].join("\n");
+}
+
 function truncateText(value: string | undefined, maxChars: number): string | undefined {
   if (typeof value !== "string") {
     return undefined;
@@ -1305,6 +1372,8 @@ function buildPortalExtraSystemPrompt(params: {
   runId?: string;
   skillSearchPrefetch?: PortalSkillSearchPrefetch;
   sharedFiles?: PortalSharedFileRecord[];
+  memoryContextPrompt?: string;
+  memoryPolicy?: PortalMemoryPolicy;
 }): string {
   const userContext = truncateText(
     stringifyJson(params.session.userContext),
@@ -1340,6 +1409,12 @@ function buildPortalExtraSystemPrompt(params: {
 
   if (userContext) {
     lines.push("", "## User Context", userContext);
+  }
+  if (params.memoryContextPrompt) {
+    lines.push("", params.memoryContextPrompt);
+  }
+  if (params.memoryPolicy) {
+    lines.push("", ...buildPortalMemoryPolicyPrompt(params.memoryPolicy));
   }
   if (params.session.historySummary) {
     lines.push("", "## Session Memory", params.session.historySummary);
@@ -4040,6 +4115,25 @@ export async function handleControlPlaneHttpRequest(
     const attachments: ChatAttachment[] = Array.isArray(body.attachments) ? body.attachments : [];
     const traceId = readOptionalString(body, "traceId");
     const portalSessionId = readOptionalString(body, "portalSessionId");
+    const memoryContext = readOptionalObject(body, "memoryContext") as
+      | PortalMemoryContext
+      | undefined;
+    const memoryPolicy = readOptionalObject(body, "memoryPolicy") as PortalMemoryPolicy | undefined;
+    const memoryContextPrompt = buildPortalMemoryContextPrompt(memoryContext);
+    if (memoryContext || memoryPolicy) {
+      logInfo(
+        `control-plane: portal message received memory context (traceId=${traceId ?? session.traceId ?? "n/a"}, remoteSessionId=${remoteSessionId}, agentId=${session.agentId}, memoryContext=${safeJsonStringify(
+          summarizePortalMemoryContextForLog(memoryContext),
+        )}, memoryPolicy=${safeJsonStringify(summarizePortalMemoryPolicyForLog(memoryPolicy))})`,
+      );
+    }
+    if (memoryContextPrompt) {
+      logInfo(
+        `control-plane: portal message injecting memory prompt (traceId=${traceId ?? session.traceId ?? "n/a"}, remoteSessionId=${remoteSessionId}, agentId=${session.agentId}, promptPreview=${safeJsonStringify(
+          memoryContextPrompt.slice(0, 1200),
+        )})`,
+      );
+    }
     const runId = `run_${randomUUID().replace(/-/g, "")}`;
     const runStartedAt = new Date().toISOString();
     const runStartedEvent = buildPortalRuntimeEvent({
@@ -4230,6 +4324,8 @@ export async function handleControlPlaneHttpRequest(
                 runId,
                 skillSearchPrefetch,
                 sharedFiles,
+                memoryContextPrompt,
+                memoryPolicy,
               }),
               portalContext: buildPortalPluginContext({
                 session: nextSession,
@@ -4561,6 +4657,8 @@ export async function handleControlPlaneHttpRequest(
             runId,
             skillSearchPrefetch,
             sharedFiles,
+            memoryContextPrompt,
+            memoryPolicy,
           }),
           portalContext: buildPortalPluginContext({
             session: nextSession,
